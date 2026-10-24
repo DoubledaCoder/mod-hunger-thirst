@@ -35,7 +35,7 @@ This is a standalone module repository. The module is **not** shipped with the c
 
    ```bash
    cd /path/to/azerothcore-wotlk
-   git clone <repository-url> modules/mod-hunger-thirst
+   git clone https://github.com/Phanty78/mod-hunger-thirst.git modules/mod-hunger-thirst
    ```
 
 2. Re-run CMake so the module is discovered, then rebuild `worldserver`:
