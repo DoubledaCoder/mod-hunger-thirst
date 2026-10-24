@@ -1,0 +1,6 @@
+## Interface: 30300
+## Title: Hunger & Thirst
+## Notes: Hunger and thirst gauges
+## SavedVariables: HungerThirstDB
+
+HungerThirst.lua

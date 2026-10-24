@@ -1,0 +1,377 @@
+[worldserver]
+
+########################################################################################################################
+# mod-hunger-thirst
+#
+# Tracks satiety and hydration per character, warns the player as the gauges
+# fall, and optionally applies exhaustion damage from the critical band and
+# more strongly when a gauge reaches zero.
+#
+# All player-facing messages (chat warnings, login summary, status command)
+# are in English.
+#
+# Two independent switches:
+#   - HungerThirst.Enable is the master switch. When 0 the module tracks
+#     nothing at all: no state is loaded or saved, Tick/CreditConsumable do
+#     nothing, and no login summary is sent. If AddonEnable=1, one synthetic
+#     disabled snapshot (mode=0, loaded=1) is still sent at login so the addon
+#     can display "Disabled". Commands still exist; the status command reports
+#     the module as disabled.
+#   - HungerThirst.Mode selects the simulation. "off" keeps the module loaded
+#     and the state persisted/queryable, but does not decay the gauges, warn,
+#     damage, or push periodic addon updates (a login snapshot with mode=0 is
+#     still sent when AddonEnable=1). "advisory" decays and warns but never
+#     damages. "survival" also damages; HungerThirst.Lethal decides whether
+#     that damage can kill.
+#
+# Damage model in survival mode:
+#   - critical band (gauge <= CriticalThreshold) and no gauge at 0:
+#     StarvingDamagePct per StarvingIntervalMs;
+#   - at least one gauge at 0: DehydratedDamagePct per DehydratedIntervalMs;
+#   - both gauges at 0: that base percentage is multiplied once by
+#     DoubleEmptyMultiplier (the two percentages are never added together);
+#   - with Lethal=1 the hit at 0 ramps and may kill; with Lethal=0 every hit
+#     keeps at least 1 health.
+#
+# All changes can be applied with ".reload config"; they take effect at the
+# next tick. Exception: switching Enable from 0 to 1 does not load state for
+# players already online (it was dropped while disabled) - they must
+# reconnect or use ".hungerthirst set"; new logins are unaffected.
+#
+# Some pauses are always active and have no configuration key: dead players,
+# characters whose state is still loading (or failed to load), and players
+# currently in a duel are never decayed, warned or damaged. Exhaustion damage
+# is also always suppressed in battlegrounds and arenas, even when
+# PauseInBattleground/PauseInArena are 0.
+#
+# Persistence uses acore_characters.hunger_thirst_state, created
+# automatically at startup:
+#   guid INT UNSIGNED PRIMARY KEY
+#   satiety DECIMAL(5,2) NOT NULL DEFAULT 100.00
+#   hydration DECIMAL(5,2) NOT NULL DEFAULT 100.00
+#   updated_at BIGINT UNSIGNED NOT NULL DEFAULT 0 (epoch milliseconds)
+# Saves are conditional on updated_at, so an older save never overwrites a
+# newer one. If the table cannot be created or verified, the simulation is
+# suspended for the affected players: no tick (decay, warnings, damage), no
+# save, no consumable credit and no periodic addon update. Login is never
+# blocked; with an active mode and ShowLoginSummary=1 the player receives a
+# "Persistence unavailable" chat notice, and when AddonEnable=1 the addon
+# displays the same status. The state stays unloaded for the whole
+# session, so a reconnect is required once the table is available again.
+#
+# Validation performed while loading:
+#   - unknown Mode -> off (LOG_ERROR)
+#   - 0 <= CriticalThreshold < WarningThreshold <= 100
+#   - all intervals/cooldowns >= 1000 ms
+#   - all gauges/percentages/multipliers clamped to their documented range
+########################################################################################################################
+
+#
+#    HungerThirst.Enable
+#        Master on/off switch. See the header comment above for the
+#        difference with HungerThirst.Mode.
+#        Default: 1
+#
+HungerThirst.Enable = 1
+
+#
+#    HungerThirst.Mode
+#        Simulation mode:
+#          off      - loaded and persisted, but no decay, warnings, damage or
+#                     periodic addon updates (default, safe installation). A
+#                     login snapshot with mode=0 is still sent if
+#                     AddonEnable=1.
+#          advisory - decay, chat warnings, login summary and addon updates;
+#                     no damage even at 0/0.
+#          survival - everything advisory does, plus exhaustion damage from
+#                     the critical band, stronger at 0.
+#        Case-insensitive. An unknown value falls back to "off" and logs an
+#        error.
+#        Default: off
+#
+HungerThirst.Mode = off
+
+#
+#    HungerThirst.Lethal
+#        Only used in survival mode. When 0 (default), damage is non-lethal:
+#        each hit is capped so the player keeps at least 1 health, and a
+#        one-time warning is sent when that floor is reached. When 1, damage
+#        can kill; the death is recorded as a non-PvP death and the death hook
+#        receives a Starvation/Dehydration/Both cause.
+#        Default: 0
+#
+HungerThirst.Lethal = 0
+
+#
+#    HungerThirst.LethalRampPct
+#        Lethal only, while at least one gauge is at 0: additional percentage
+#        of maximum health added to the DehydratedDamagePct base for each
+#        consecutive hit (the DoubleEmptyMultiplier applies once when both are
+#        0). Capped by LethalMaxDamagePct. Clamped to 0..100.
+#        Default: 0.50
+#
+HungerThirst.LethalRampPct = 0.50
+
+#
+#    HungerThirst.LethalMaxDamagePct
+#        Lethal only: cap for a hit while at least one gauge is at 0, as a
+#        percentage of maximum health, ramp included. Critical-band hits
+#        without an empty gauge use StarvingDamagePct and are not capped by
+#        this value. Clamped to 0..100.
+#        Default: 5.00
+#
+HungerThirst.LethalMaxDamagePct = 5.00
+
+#
+#    HungerThirst.SatietyDecayPerMinute
+#        Satiety points lost per minute of active play (before the rest and
+#        instance multipliers). 0 disables satiety decay. Clamped to 0..100.
+#        Default: 0.50
+#
+HungerThirst.SatietyDecayPerMinute = 0.50
+
+#
+#    HungerThirst.HydrationDecayPerMinute
+#        Hydration points lost per minute of active play (before multipliers).
+#        Hydration normally drains slightly faster than satiety. Clamped to
+#        0..100.
+#        Default: 0.75
+#
+HungerThirst.HydrationDecayPerMinute = 0.75
+
+#
+#    HungerThirst.RestMultiplier
+#        Decay multiplier while resting (REST_FLAG_IN_TAVERN,
+#        REST_FLAG_IN_CITY or REST_FLAG_IN_FACTION_AREA). Multiplies the
+#        per-tick decay. Clamped to 0..10.
+#        Default: 0.50
+#
+HungerThirst.RestMultiplier = 0.50
+
+#
+#    HungerThirst.InstanceMultiplier
+#        Decay multiplier while inside a dungeon or raid map
+#        (Map::IsDungeon). Stacks multiplicatively with RestMultiplier if a
+#        rest area is also an instance. Clamped to 0..10.
+#        Default: 1.00
+#
+HungerThirst.InstanceMultiplier = 1.00
+
+#
+#    HungerThirst.PauseOnTaxi
+#        Suspend decay, warnings and damage while the player is on a taxi
+#        flight.
+#        Default: 1
+#
+HungerThirst.PauseOnTaxi = 1
+
+#
+#    HungerThirst.PauseInBattleground
+#        Suspend decay, warnings and periodic addon updates while the player
+#        is in a battleground or arena (the arena switch below is an
+#        additional guard). Exhaustion damage is always suppressed in both,
+#        even when this is 0; with both switches at 0, decay and warnings
+#        keep running.
+#        Default: 1
+#
+HungerThirst.PauseInBattleground = 1
+
+#
+#    HungerThirst.PauseInArena
+#        Suspend decay, warnings and periodic addon updates while the player
+#        is in an arena match. Exhaustion damage is always suppressed in
+#        arenas, even when this is 0 and PauseInBattleground is 0; decay and
+#        warnings then keep running.
+#        Default: 1
+#
+HungerThirst.PauseInArena = 1
+
+#
+#    HungerThirst.ExemptGMs
+#        Suspend the module for accounts with GM security. Also prevents
+#        environmental damage while debugging.
+#        Default: 1
+#
+HungerThirst.ExemptGMs = 1
+
+#
+#    HungerThirst.WarningThreshold
+#        Upper bound of the "warning" band, in gauge points. A gauge above
+#        this value is normal; at or below it the player is hungry/thirsty.
+#        Must be <= 100 and greater than CriticalThreshold.
+#        Default: 25
+#
+HungerThirst.WarningThreshold = 25
+
+#
+#    HungerThirst.CriticalThreshold
+#        Upper bound of the "critical" band, in gauge points. At or below it
+#        the player is starving/dehydrated and survival damage begins; at 0
+#        the gauge is empty and damage uses the dehydrated path. Must be
+#        lower than WarningThreshold.
+#        Default: 10
+#
+HungerThirst.CriticalThreshold = 10
+
+#
+#    HungerThirst.StarvingDamagePct
+#        Survival only: damage per hit, as a percentage of maximum health,
+#        while at least one gauge is in the critical band
+#        (0 < gauge <= CriticalThreshold) and neither gauge is at 0.
+#        Clamped to 0..100.
+#        Default: 0.50
+#
+HungerThirst.StarvingDamagePct = 0.50
+
+#
+#    HungerThirst.StarvingIntervalMs
+#        Survival only: milliseconds between hits while a gauge is critical
+#        and neither gauge is at 0. Values below 1000 are clamped to 1000.
+#        Default: 10000
+#
+HungerThirst.StarvingIntervalMs = 10000
+
+#
+#    HungerThirst.DehydratedDamagePct
+#        Survival only: base damage per hit, as a percentage of maximum
+#        health, as soon as at least one gauge is at 0 (whatever the other
+#        gauge is). Clamped to 0..100.
+#        Default: 1.00
+#
+HungerThirst.DehydratedDamagePct = 1.00
+
+#
+#    HungerThirst.DehydratedIntervalMs
+#        Survival only: milliseconds between hits while at least one gauge is
+#        at 0. Values below 1000 are clamped to 1000.
+#        Default: 5000
+#
+HungerThirst.DehydratedIntervalMs = 5000
+
+#
+#    HungerThirst.DoubleEmptyMultiplier
+#        Survival only: when both gauges are at 0, the DehydratedDamagePct
+#        base is multiplied by this value once. The starvation and dehydration
+#        percentages are never added together. In lethal mode the same single
+#        multiplier applies to the ramp base. Clamped to 1.00..10.00.
+#        Default: 1.50
+#
+HungerThirst.DoubleEmptyMultiplier = 1.50
+
+#
+#    HungerThirst.FoodSatietyGain
+#        Satiety restored when a food aura is credited (spell specific FOOD or
+#        FOOD_AND_DRINK). The configured gain is clamped to 0..100 and the
+#        gauge itself to 100.
+#        Default: 30.00
+#
+HungerThirst.FoodSatietyGain = 30.00
+
+#
+#    HungerThirst.DrinkHydrationGain
+#        Hydration restored when a drink aura is credited (spell specific
+#        DRINK or FOOD_AND_DRINK). The configured gain is clamped to 0..100 and
+#        the gauge itself to 100.
+#        Default: 35.00
+#
+HungerThirst.DrinkHydrationGain = 35.00
+
+#
+#    HungerThirst.RestoreCooldownMs
+#        Anti-double-credit window for item-based food/drink only: the same
+#        cast item entry is credited at most once per this window (refresh
+#        callbacks for the same bite are ignored). Auras without a cast item
+#        use AuraCreditCooldownMs instead. Values below 1000 are clamped to
+#        1000.
+#        Default: 1000
+#
+HungerThirst.RestoreCooldownMs = 1000
+
+#
+#    HungerThirst.AuraCreditCooldownMs
+#        Anti-double-credit window for every food/drink aura without a cast
+#        item (feast, gameobject, player-cast aura). The credit is keyed by
+#        (spellId, casterGuid) and the actual window is max(this value, aura
+#        duration), so one feast tick credits a player once, not once per
+#        server tick. Values below 1000 are clamped to 1000.
+#        Default: 30000
+#
+HungerThirst.AuraCreditCooldownMs = 30000
+
+#
+#    HungerThirst.StartingSatiety
+#        Satiety assigned to a character with no stored row (new character or
+#        first login after installing the module). Clamped to 0..100.
+#        Default: 100.00
+#
+HungerThirst.StartingSatiety = 100.00
+
+#
+#    HungerThirst.StartingHydration
+#        Hydration assigned to a character with no stored row. Clamped to
+#        0..100.
+#        Default: 100.00
+#
+HungerThirst.StartingHydration = 100.00
+
+#
+#    HungerThirst.Hysteresis
+#        Points a gauge must gain strictly above the threshold it is leaving
+#        before the band improves. Bands always worsen immediately. 0 disables
+#        hysteresis. Clamped to 0..(100 - WarningThreshold) so a full gauge
+#        can always leave the warning band.
+#        Default: 2.00
+#
+HungerThirst.Hysteresis = 2.00
+
+#
+#    HungerThirst.ShowLoginSummary
+#        Send a one-line chat summary (mode, gauges, bands) on login
+#        when the module is enabled and not in mode off.
+#        Default: 1
+#
+HungerThirst.ShowLoginSummary = 1
+
+#
+#    HungerThirst.DebugLog
+#        Emit LOG_DEBUG lines for state load/save, consumable credits and
+#        exhaustion damage.
+#        Default: 0
+#
+HungerThirst.DebugLog = 0
+
+#
+#    HungerThirst.AddonEnable
+#        Send the addon state packet when Enable=1, AddonEnable=1 and the
+#        player's state is loaded. A packet is sent at login even in mode off
+#        (mode=0) so the addon can display "Disabled"; periodic packets only
+#        run while Tick is active (advisory/survival, not paused). The packet
+#        is a CHAT_MSG_WHISPER / LANG_ADDON message sent directly to the
+#        player:
+#
+#            HT<TAB>satiety<TAB>hydration<TAB>mode<TAB>lethal<TAB>loaded<TAB>persistence<TAB>satBand<TAB>hydBand
+#
+#        The payload is the prefix plus exactly 8 fields (no extra field):
+#        satiety/hydration use one decimal; mode is 0=off, 1=advisory,
+#        2=survival; bands are 0=normal, 1=warning, 2=critical, 3=empty;
+#        lethal/loaded/persistence are 0/1. No colors.
+#        Default: 1
+#
+HungerThirst.AddonEnable = 1
+
+#
+#    HungerThirst.AddonUpdateIntervalMs
+#        Periodic addon packet cadence in milliseconds while Tick is active.
+#        The login snapshot is sent immediately. Values below 1000 are clamped
+#        to 1000.
+#        Default: 1000
+#
+HungerThirst.AddonUpdateIntervalMs = 1000
+
+#
+#    HungerThirst.AddonPrefix
+#        Prefix written as the first tab-separated field of the addon packet.
+#        Must match the addon's prefix. An empty value falls back to "HT".
+#        Default: HT
+#
+HungerThirst.AddonPrefix = "HT"
