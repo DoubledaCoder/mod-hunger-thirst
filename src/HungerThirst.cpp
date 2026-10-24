@@ -18,7 +18,7 @@
  *   - A DB error is not treated as "new character": the state stays
  *     Loaded=false and is neither ticked nor saved until a successful load.
  *
- * Released under GNU GPL v2 or (at your option) any later version.
+ * Released under the MIT license; see LICENSE.
  */
 
 #include "HungerThirst.h"
