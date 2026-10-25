@@ -2,9 +2,9 @@
 
 ## Description
 
-Hunger & Thirst is a standalone [AzerothCore](https://www.azerothcore.org/) module for World of Warcraft: Wrath of the Lich King 3.3.5a. It gives every character a satiety gauge and a hydration gauge, both running from 0 to 100. The gauges fall over time, are restored by eating and drinking, and can apply exhaustion damage when they run low.
+Hunger & Thirst is a standalone [AzerothCore](https://www.azerothcore.org/) module for World of Warcraft: Wrath of the Lich King 3.3.5a. It gives every character a satiety gauge and a hydration gauge, both running from 0 to 100. The gauges fall over time and are restored by eating and drinking. In `survival` mode, low satiety shows a visible hunger state, a debuff that slows the character and weakens combat, while low hydration applies exhaustion damage.
 
-No client patch is required. A graphical addon is included but **optional**: without it, chat warnings, the login summary and the `.hungerthirst` command remain available.
+No client patch is required: the hunger states reuse two standard Blizzard spells, including their icons, as server-side auras. A graphical addon is included but **optional**: without it, chat warnings, the login summary and the `.hungerthirst` command remain available.
 
 This repository is a module repository, not a fork of the core. It is not bundled with AzerothCore and must be installed into the `modules/` directory of an existing WotLK 3.3.5a source tree.
 
@@ -13,9 +13,10 @@ This repository is a module repository, not a fork of the core. It is not bundle
 - Per-character satiety and hydration gauges persisted in the characters database.
 - Decay based on active play time, with separate rest-area and dungeon/raid multipliers.
 - Configurable pauses for taxi flights, battlegrounds, arenas, duels and game masters.
-- Warning and critical thresholds with hysteresis, chat warnings and an optional login summary.
+- Warning and critical thresholds with hysteresis, chat warnings, an optional login summary and a hunger-state entry threshold at the warning band.
 - Three simulation modes: `off`, `advisory` and `survival`.
-- Optional exhaustion damage with non-lethal and lethal variants, a lethal damage ramp and a double-empty multiplier.
+- Two visible hunger states in `survival` mode, built on two otherwise unused Blizzard spells: a weakened state at or below the warning threshold (movement speed and damage dealt reduced, damage taken increased) and a stronger starving state at 0.
+- Optional hydration-only exhaustion damage with non-lethal and lethal variants, a lethal damage ramp and a double-empty multiplier. Hunger no longer deals damage; it drives the visible state instead.
 - Food and drink credit from items, feasts, game objects and player-cast auras, with anti-double-credit windows.
 - Optional client addon using the `HT` addon prefix and the built-in 3.3.5a textures only.
 - No SQL file to import: the characters table is created automatically at startup.
@@ -61,7 +62,7 @@ This is a standalone module repository. The module is **not** shipped with the c
 
    On a native install, use the module configuration directory read by your `worldserver` (`etc/modules/` in a default Linux install). The module is deliberately shipped with `HungerThirst.Mode = off`; set the mode you want in this file.
 
-4. Restart `worldserver`. The module does not start tracking until the rebuilt binary and the `.conf` file are both in place. Later configuration changes can be applied with `.reload config` instead of a restart, except for the `Enable` transition described under [Configuration](#configuration).
+4. Restart `worldserver`. The module does not start tracking until the rebuilt binary and the `.conf` file are both in place. Later configuration changes can be applied with `.reload config` instead of a restart, except for the `Enable` transition and the two hunger-state penalty percentages described under [Configuration](#configuration).
 
 5. Optional: install the client addon from `client/Interface/AddOns/HungerThirst` as described under [Addon](#addon-optional).
 
@@ -71,28 +72,33 @@ The configuration file is `conf/mod_hunger_thirst.conf.dist` in this repository 
 
 Changes can be applied with `.reload config`; they take effect at the next tick. Exception: changing `HungerThirst.Enable` from `0` to `1` does not load state for players who are already online, because their state was dropped while the module was disabled. Those players must reconnect, or a game master can initialize them with `.hungerthirst set`; new logins are unaffected.
 
+Another exception: `HungerThirst.HungerStatePenaltyPct` and `HungerThirst.HungerStarvingPenaltyPct` are baked into the two hunger-state spell auras when `worldserver` starts. Changing either value requires a restart of `worldserver`. A configuration reload alone leaves the aura magnitudes at their startup values, and an entry chat line sent after the reload quotes the new value while the aura keeps the old one. The two spells are patched at startup even when `HungerStates=0`, so enabling the states later with a reload never applies the original Blizzard spells.
+
 | Key | Default | Description |
 |---|---|---|
 | `HungerThirst.Enable` | `1` | Master switch. With `0` the module loads and saves nothing: no decay, warnings, damage, consumable credit or periodic addon updates, and the status command reports the module as disabled. If `AddonEnable=1`, one synthetic disabled snapshot is still sent at login so the addon can display `Disabled`. Commands remain registered, but `set` and `reset` refuse to run. |
 | `HungerThirst.Mode` | `off` | Simulation mode: `off`, `advisory` or `survival` (case-insensitive). An unknown value falls back to `off` and logs an error. See [Modes](#modes). |
-| `HungerThirst.Lethal` | `0` | Survival only. `0` keeps damage non-lethal: each hit is capped so at least 1 health remains, and a one-time warning is sent when that floor is reached. `1` allows damage to kill; a module-caused death is recorded as a non-PvP death and carries a Starvation, Dehydration or Both cause to the death hook. |
-| `HungerThirst.LethalRampPct` | `0.50` | Lethal only. While at least one gauge is at 0, percentage of maximum health added to the `DehydratedDamagePct` base for each consecutive hit. `DoubleEmptyMultiplier` is applied once when both gauges are at 0. Capped by `LethalMaxDamagePct`; clamped to 0-100. |
-| `HungerThirst.LethalMaxDamagePct` | `5.00` | Lethal only. Cap for a hit while at least one gauge is at 0, as a percentage of maximum health, ramp included. Critical-band hits without an empty gauge use `StarvingDamagePct` and are not capped by this value. Clamped to 0-100. |
+| `HungerThirst.Lethal` | `0` | Survival only. `0` keeps damage non-lethal: each hit is capped so at least 1 health remains, and a one-time warning is sent when that floor is reached. `1` allows damage to kill; a module-caused death is recorded as a non-PvP death, and the death hook receives a `Dehydration` cause, or `Both` when both gauges are at 0. The `Starvation` cause is reserved for phase 2. |
+| `HungerThirst.LethalRampPct` | `0.50` | Lethal only. While hydration is at 0, percentage of maximum health added to the `DehydratedDamagePct` base for each consecutive hit. `DoubleEmptyMultiplier` is applied once when both gauges are at 0. Capped by `LethalMaxDamagePct`; clamped to 0-100. |
+| `HungerThirst.LethalMaxDamagePct` | `5.00` | Lethal only. Cap for a hydration hit while hydration is at 0, as a percentage of maximum health, ramp included. Hits in the critical hydration band above 0 use `StarvingDamagePct` and are not capped by this value. Clamped to 0-100. |
 | `HungerThirst.SatietyDecayPerMinute` | `0.50` | Satiety points lost per minute of active play, before the rest and instance multipliers. `0` disables satiety decay. Clamped to 0-100. |
 | `HungerThirst.HydrationDecayPerMinute` | `0.75` | Hydration points lost per minute of active play, before multipliers. Hydration drains slightly faster than satiety at the default values. Clamped to 0-100. |
 | `HungerThirst.RestMultiplier` | `0.50` | Decay multiplier while resting (`REST_FLAG_IN_TAVERN`, `REST_FLAG_IN_CITY` or `REST_FLAG_IN_FACTION_AREA`). Multiplies the per-tick decay. Clamped to 0-10. |
 | `HungerThirst.InstanceMultiplier` | `1.00` | Decay multiplier inside a dungeon or raid map (`Map::IsDungeon`). Stacks multiplicatively with `RestMultiplier` if a rest area is also an instance. Clamped to 0-10. |
-| `HungerThirst.PauseOnTaxi` | `1` | Suspend decay, warnings, damage and periodic addon updates while the player is on a taxi flight. |
-| `HungerThirst.PauseInBattleground` | `1` | Suspend decay, warnings and periodic addon updates while the player is in a battleground or arena (the arena switch below is an additional guard). Exhaustion damage is always suppressed in both even when this is `0`; with both switches at `0`, decay and warnings keep running. |
-| `HungerThirst.PauseInArena` | `1` | Suspend decay, warnings and periodic addon updates while the player is in an arena match. Exhaustion damage is always suppressed in arenas even when this and `PauseInBattleground` are `0`; decay and warnings then keep running. |
+| `HungerThirst.PauseOnTaxi` | `1` | Suspend decay, warnings, damage, hunger-state updates and periodic addon updates while the player is on a taxi flight. |
+| `HungerThirst.PauseInBattleground` | `1` | Suspend decay, warnings, hunger-state updates and periodic addon updates while the player is in a battleground or arena (the arena switch below is an additional guard). Exhaustion damage is always suppressed in both even when this is `0`; with both switches at `0`, decay, warnings and hunger states keep running. |
+| `HungerThirst.PauseInArena` | `1` | Suspend decay, warnings, hunger-state updates and periodic addon updates while the player is in an arena match. Exhaustion damage is always suppressed in arenas even when this and `PauseInBattleground` are `0`; decay, warnings and hunger states then keep running. |
 | `HungerThirst.ExemptGMs` | `1` | Skip the module entirely for accounts with game master security. Also prevents environmental damage while debugging. |
-| `HungerThirst.WarningThreshold` | `25` | Upper bound of the warning band, in gauge points. A gauge above this value is normal; at or below it the player is hungry or thirsty. Must be `<= 100` and greater than `CriticalThreshold`. |
-| `HungerThirst.CriticalThreshold` | `10` | Upper bound of the critical band, in gauge points. At or below it the player is very hungry or very thirsty and survival damage begins; at `0` the gauge is empty and damage uses the dehydrated path. Must be lower than `WarningThreshold`. |
-| `HungerThirst.StarvingDamagePct` | `0.50` | Survival only. Damage per hit, as a percentage of maximum health, while at least one gauge is in the critical band (`0 < gauge <= CriticalThreshold`) and neither gauge is at 0. Clamped to 0-100. |
-| `HungerThirst.StarvingIntervalMs` | `10000` | Survival only. Milliseconds between hits while a gauge is critical and neither gauge is at 0. Values below 1000 are clamped to 1000. |
-| `HungerThirst.DehydratedDamagePct` | `1.00` | Survival only. Base damage per hit, as a percentage of maximum health, as soon as at least one gauge is at 0, whatever the other gauge is. Clamped to 0-100. |
-| `HungerThirst.DehydratedIntervalMs` | `5000` | Survival only. Milliseconds between hits while at least one gauge is at 0. Values below 1000 are clamped to 1000. |
-| `HungerThirst.DoubleEmptyMultiplier` | `1.50` | Survival only. When both gauges are at 0, the `DehydratedDamagePct` base is multiplied by this value once. The starvation and dehydration percentages are never added together. In lethal mode the same single multiplier applies to the ramp base. Clamped to 1.00-10.00. |
+| `HungerThirst.WarningThreshold` | `30` | Upper bound of the warning band, in gauge points. A gauge above this value is normal; at or below it the player is hungry or thirsty. In `survival` mode with `HungerStates=1` it is also the entry threshold of the weakened hunger state. Must be `<= 100` and greater than `CriticalThreshold`. |
+| `HungerThirst.CriticalThreshold` | `10` | Upper bound of the critical band, in gauge points. At or below it the player is very hungry or very thirsty: critical hydration uses `StarvingDamagePct` in `survival` mode, and critical satiety keeps the weakened hunger state. At `0` the gauge is empty: hydration switches to the dehydrated damage path and satiety switches the hunger state to starving. Must be lower than `WarningThreshold`. |
+| `HungerThirst.HungerStates` | `1` | `survival` only. `1` enables the two visible hunger states: weakened at or below `WarningThreshold` (and above 0), starving at 0. They reduce movement speed and damage dealt and increase damage taken by a fixed percentage. `0` removes the states, so hunger has no gameplay effect; satiety band chat warnings are then not sent in `survival` (they remain available in `advisory`). See [Hunger states](#hunger-states). |
+| `HungerThirst.HungerStatePenaltyPct` | `10.00` | Penalty of the weakened state, in percent: movement speed and damage dealt are reduced by this value, damage taken is increased by the same value. Clamped to 0-90. Baked into the spell aura at startup, so changing it requires a restart. |
+| `HungerThirst.HungerStarvingPenaltyPct` | `30.00` | Penalty of the starving state, in percent, applied to the same three effects: movement speed and damage dealt reduced, damage taken increased. Clamped to 0-90. Baked into the spell aura at startup, so changing it requires a restart. |
+| `HungerThirst.StarvingDamagePct` | `0.50` | Survival only. Damage per hit, as a percentage of maximum health, while hydration is in the critical band (`0 < hydration <= CriticalThreshold`). The key name is historical: hunger no longer deals damage, so it only feeds critical dehydration. Clamped to 0-100. |
+| `HungerThirst.StarvingIntervalMs` | `10000` | Survival only. Milliseconds between hits while hydration is critical and above 0. Values below 1000 are clamped to 1000. |
+| `HungerThirst.DehydratedDamagePct` | `1.00` | Survival only. Base damage per hit, as a percentage of maximum health, as soon as hydration is at 0, whatever the satiety value. Clamped to 0-100. |
+| `HungerThirst.DehydratedIntervalMs` | `5000` | Survival only. Milliseconds between hits while hydration is at 0. Values below 1000 are clamped to 1000. |
+| `HungerThirst.DoubleEmptyMultiplier` | `1.50` | Survival only. When both gauges are at 0, the `DehydratedDamagePct` base is multiplied by this value once. Empty satiety adds no damage of its own: the multiplier only amplifies dehydration, and the critical-band and empty-hydration percentages are never added together. In lethal mode the same single multiplier applies to the ramp base. Clamped to 1.00-10.00. |
 | `HungerThirst.FoodSatietyGain` | `30.00` | Satiety restored when a food aura is credited (`SPELL_SPECIFIC_FOOD` or `FOOD_AND_DRINK`). The gain is clamped to 0-100 and the gauge itself to 100. |
 | `HungerThirst.DrinkHydrationGain` | `35.00` | Hydration restored when a drink aura is credited (`SPELL_SPECIFIC_DRINK` or `FOOD_AND_DRINK`). The gain is clamped to 0-100 and the gauge itself to 100. |
 | `HungerThirst.RestoreCooldownMs` | `1000` | Anti-double-credit window for item-based food and drink only: the same cast item entry is credited at most once per window, so refresh callbacks for one bite are ignored. Auras without a cast item use `AuraCreditCooldownMs` instead. Values below 1000 are clamped to 1000. |
@@ -111,6 +117,7 @@ Validation performed while loading:
 - An unknown `Mode` becomes `off` and logs an error.
 - `CriticalThreshold` must be lower than `WarningThreshold`; otherwise the critical threshold is adjusted and an error is logged. `WarningThreshold` above 100 is clamped to 100.
 - Gauges, percentages, gains and decay rates are clamped to 0-100.
+- `HungerStatePenaltyPct` and `HungerStarvingPenaltyPct` are clamped to 0-90 rather than 0-100.
 - `RestMultiplier` and `InstanceMultiplier` are clamped to 0-10.
 - `DoubleEmptyMultiplier` is clamped to 1.00-10.00.
 - Intervals and cooldowns are clamped to a minimum of 1000 ms.
@@ -131,13 +138,15 @@ The command is available in game only, not from the server console. Subcommands 
 
 ## Modes
 
-| `HungerThirst.Mode` | Decay | Warnings and login summary | Damage | Periodic addon updates |
-|---|---|---|---|---|
-| `off` (default) | No | No | No | No |
-| `advisory` | Yes | Yes | No, even at 0/0 | Yes |
-| `survival` | Yes | Yes | Yes, from the critical band; stronger when a gauge reaches 0 | Yes |
+| `HungerThirst.Mode` | Decay | Warnings and login summary | Hunger states | Damage | Periodic addon updates |
+|---|---|---|---|---|---|
+| `off` (default) | No | No | No | No | No |
+| `advisory` | Yes | Yes | No | No, even at 0/0 | Yes |
+| `survival` | Yes | Thirst warnings and login summary; satiety warnings replaced by the state chat line when `HungerStates=1` | Yes with `HungerStates=1` | Hydration only; stronger when hydration reaches 0 | Yes |
 
 `off` keeps the module loaded: the state is persisted and can be queried, and the login addon snapshot is still sent with `mode=0`, but nothing is simulated. `Enable=0` is stronger than `Mode=off`: state is not loaded or saved at all and the module reports itself as disabled.
+
+Hunger states exist only in `survival` mode with `HungerStates=1`; in `off` and `advisory`, any active hunger-state aura is removed at the next tick. Survival damage is hydration-only in phase 1: the satiety band drives the visible hunger state instead of damage, and thirst warnings and dehydration damage are unchanged. With `HungerStates=0`, hunger has no gameplay effect at all and its band warnings are not sent in `survival`; `advisory` still shows them.
 
 ### Bands
 
@@ -148,29 +157,48 @@ The command is available in game only, not from the server console. Subcommands 
 | Critical | Very hungry | Very thirsty |
 | Empty | Starving | Dehydrated |
 
-A gauge is empty at 0, critical at or below `CriticalThreshold`, in the warning band at or below `WarningThreshold`, and normal above it. Warning messages fire when a band worsens. Hysteresis prevents messages from flapping around a threshold: a band only improves once the gauge is strictly above the threshold it is leaving plus `Hysteresis`.
+A gauge is empty at 0, critical at or below `CriticalThreshold`, in the warning band at or below `WarningThreshold`, and normal above it. Warning messages fire when a band worsens. Hysteresis prevents messages from flapping around a threshold: a band only improves once the gauge is strictly above the threshold it is leaving plus `Hysteresis`. In `survival` mode the satiety band also selects the hunger state; with `HungerStates=1` the satiety band warnings are replaced by the state chat line, while hydration warnings keep their usual behavior.
 
 The status command uses the words `loaded` or `not loaded` for the state and `ready` or `unavailable` for persistence.
 
+### Hunger states
+
+In `survival` mode with `HungerStates=1`, the satiety band drives a visible debuff. The module reuses two Blizzard spells that ship with the 3.3.5a client and are otherwise unused, and patches their server-side spell data in memory at startup. No client patch, MPQ or DBC change is involved.
+
+| State | Satiety | Spell ID | Name (enUS / frFR) | Icon | Effects |
+|---|---|---|---|---|---|
+| Weakened | above 0 and at or below `WarningThreshold` (warning or critical band, 30 by default) | 52749 | Voracious Appetite / Appétit vorace | `ability_racial_cannibalize` | Movement speed -`HungerStatePenaltyPct`%, damage dealt -`HungerStatePenaltyPct`%, damage taken +`HungerStatePenaltyPct`% (10% by default) |
+| Starving | 0 | 55316 | Ravenous Hunger / Faim dévorante | `spell_holy_stoicism` | Movement speed -`HungerStarvingPenaltyPct`%, damage dealt -`HungerStarvingPenaltyPct`%, damage taken +`HungerStarvingPenaltyPct`% (30% by default) |
+
+- The state uses the same band and hysteresis logic as the gauges. The weakened state starts as soon as satiety enters the warning band and ends when the band returns to normal; a gauge leaving the warning band must rise strictly above `WarningThreshold + Hysteresis` (32 by default). The starving state starts at 0 and ends as soon as satiety rises above 0. Eating one bite from 0 to 30 by default therefore replaces starving with weakened, not with no state.
+- Entering a state applies an infinite-duration aura and sends exactly one English chat line with the real percentages. The line is sent on entry only, never per tick. Leaving a state removes its aura; switching between the two states removes the old aura before applying the new one.
+- The three effects are speed reduction, damage-dealt reduction and damage-taken increase. Damage effects cover every spell school. The percentage is the same for all three effects of a state, but differs between the weakened and starving states.
+- The aura is a negative debuff (red border) and cannot be dispelled, cancelled by right-click or removed by immunity effects: the patched spells have no dispel type and no mechanic. Only the module removes them, following the band, when the states are disabled or when the mode leaves `survival`.
+- The state is reconciled on every active tick, which covers login, resurrection, `.reload config` and `.hungerthirst set/reset`. Death removes all auras by core behavior; the next active tick after resurrection re-applies the state if the band still calls for it.
+- Any pause (taxi, battleground, arena, duel, GM exemption) stops the tick: gauges are frozen and the state is left exactly as it was, with no chat line and no update. In battlegrounds and arenas, exhaustion damage stays suppressed even when the corresponding pause switch is `0`.
+- The client displays the original Blizzard spell name and icon. Its tooltip keeps the original Blizzard description and does not show the configured percentages; the chat line, the configuration and this README are the authoritative source. On a frFR client the names are "Appétit vorace" and "Faim dévorante".
+- If either spell cannot be found at startup, the module logs an error and disables the hunger states instead of applying an unpatched spell.
+- Phase 2: thirst will receive its own visible states and the remaining exhaustion damage will be retired. Until then, thirst keeps its current warnings and dehydration damage.
+
 ### Damage model
 
-Damage is applied only in `survival` mode, and only while at least one gauge is in the critical band. Exhaustion damage is always suppressed in battlegrounds and arenas, even when `PauseInBattleground` or `PauseInArena` is `0`.
+Exhaustion damage is applied only in `survival` mode, and it is hydration-only: hunger never deals damage in phase 1, because the satiety band drives the visible hunger state instead. Exhaustion damage is always suppressed in battlegrounds and arenas, even when `PauseInBattleground` or `PauseInArena` is `0`.
 
-- While at least one gauge is critical but neither gauge is at 0, the module applies `StarvingDamagePct` percent of maximum health every `StarvingIntervalMs`.
-- As soon as at least one gauge is at 0, it applies `DehydratedDamagePct` percent of maximum health every `DehydratedIntervalMs`.
-- If both gauges are at 0, the dehydration base is multiplied once by `DoubleEmptyMultiplier`; the two percentages are never added together.
+- While hydration is in the critical band but not at 0 (`0 < hydration <= CriticalThreshold`), the module applies `StarvingDamagePct` percent of maximum health every `StarvingIntervalMs`. The key names are historical; they now govern critical dehydration only.
+- As soon as hydration is at 0, it applies `DehydratedDamagePct` percent of maximum health every `DehydratedIntervalMs`, whatever the satiety value.
+- If both gauges are at 0, the dehydration base is multiplied once by `DoubleEmptyMultiplier`. Empty satiety adds no damage of its own and the critical-band and empty-hydration percentages are never added together.
 - With `Lethal=0`, every hit is capped so at least 1 health remains, and a one-time warning is sent when that floor is reached. The module can never kill in this configuration.
-- With `Lethal=1`, a hit taken while at least one gauge is at 0 also gains an additive ramp of `LethalRampPct` percent of maximum health per consecutive hit, capped at `LethalMaxDamagePct`. When both gauges are at 0, the once-only `DoubleEmptyMultiplier` applies to that base. Damage can kill.
+- With `Lethal=1`, a hydration hit taken at 0 also gains an additive ramp of `LethalRampPct` percent of maximum health per consecutive hit, capped at `LethalMaxDamagePct`. When both gauges are at 0, the once-only `DoubleEmptyMultiplier` applies to that base. Damage can kill, and the death is recorded with a `Dehydration` cause, or `Both` when both gauges are at 0; the `Starvation` cause is never emitted in phase 1.
 
 ### Pauses and exemptions
 
-- Dead characters, characters not yet in the world and characters whose state is still loading or failed to load are never decayed, warned or damaged.
+- Dead characters, characters not yet in the world and characters whose state is still loading or failed to load are never decayed, warned or damaged. Death removes the hunger-state auras by core behavior; the state is re-applied by the next active tick after resurrection if the band still calls for it.
 - A player in a duel is always paused. There is no configuration key for this.
 - A taxi flight pauses the module when `PauseOnTaxi=1`.
-- A battleground or arena pauses the module when the corresponding switch is `1`. Exhaustion damage is separately and always suppressed there.
+- A battleground or arena pauses the module when the corresponding switch is `1`. Exhaustion damage is separately and always suppressed there, but hunger states still update if decay is not paused.
 - GM accounts are skipped when `ExemptGMs=1`.
 
-While paused, decay, warnings, damage and periodic addon updates stop. The login snapshot is unaffected.
+While paused, decay, warnings, damage, hunger-state updates and periodic addon updates stop. The login snapshot is unaffected. An existing hunger-state aura stays in place for the duration of the pause, so a paused player keeps the debuff without any further chat line; if the state aura was removed (for example by death) while the pause applies, it is restored by the first active tick once no pause applies.
 
 ## Persistence
 
@@ -226,23 +254,26 @@ A login snapshot is sent immediately. In mode `off` it carries `mode=0` and no p
 
 Two small status icons, one for satiety and one for hydration, are shown by default even when the gauge window is hidden. They sit at the bottom right of the screen, can be moved by dragging, and their position is saved. The border color indicates the band: gray for normal, yellow for warning, orange for critical and red for empty. The tooltip shows the value out of 100, the band and the active mode. A left click on either icon shows or hides the gauge window. The icons use only built-in 3.3.5a textures (`INV_Misc_Food_15` and `INV_Drink_05`); no custom texture or client patch is needed.
 
-Without the addon, everything remains functional through chat warnings, the login summary and the `.hungerthirst` command.
+Without the addon, everything remains functional through chat warnings, the hunger-state debuffs, the login summary and the `.hungerthirst` command.
 
 ## Compatibility
 
 - The module is server-side. It needs no client patch, no custom MPQ, no custom texture and no SQL import.
+- The hunger states reuse two spells shipped with the stock 3.3.5a client, 52749 ("Voracious Appetite") and 55316 ("Ravenous Hunger"), which no core content uses. Their server-side spell data is patched in memory at `worldserver` startup; no DBC file, MPQ, client file or core source file is modified.
 - It uses public AzerothCore script hooks (world configuration and startup, player load/login/update/save/logout/delete, aura apply and unit death) and its own `hunger_thirst_state` table. No core file is modified.
 - The configuration namespace (`HungerThirst.*`), the command (`.hungerthirst`) and the addon prefix (`HT`) are module-specific, so the module can be installed alongside other standalone modules.
-- There is no direct coupling with `mod-hardcore`. The module never resurrects a character and never writes a death table. With `survival` **and** `Lethal=1`, a death caused by hunger or thirst is an ordinary player death, so a hardcore policy applies as usual. With `Lethal=0` (the default), the module can never kill a character.
-- Each death caused by the module writes one `LOG_INFO` line containing the name, GUID, level, map ID, zone ID, cause, lethal flag, persistence status and final gauges with their bands. No global announcement is made and no death history is written to the database.
+- There is no direct coupling with `mod-hardcore`. The module never resurrects a character and never writes a death table. With `survival` **and** `Lethal=1`, a death caused by dehydration, including the amplified hit when both gauges are at 0, is an ordinary player death, so a hardcore policy applies as usual. With `Lethal=0` (the default), the module can never kill a character.
+- Each death caused by the module writes one `LOG_INFO` line containing the name, GUID, level, map ID, zone ID, cause, lethal flag, persistence status and final gauges with their bands. In phase 1 the cause is `Dehydration`, or `Both` when both gauges are at 0. No global announcement is made and no death history is written to the database.
 
 ## Limitations
 
-- The 3.3.5a client exposes no native hunger or thirst gauge. The visual display therefore depends on the optional addon; without it, only chat messages and commands are available.
+- The 3.3.5a client exposes no native hunger or thirst gauge. The visual display therefore depends on the optional addon; without it, only the state debuffs, chat messages and commands are available.
+- The hunger-state debuff shows a Blizzard spell name and icon. Its tooltip keeps the original Blizzard description and does not display the configured penalties; the real values appear in the entry chat line, the configuration and this README. On the weakened spell the client may briefly show the original short duration countdown, but the server keeps the aura as long as the state lasts.
 - The module ships with `Mode = off`. Without explicit configuration it has no gameplay effect.
-- Exhaustion damage exists only in `survival` mode, and `Lethal=0` prevents it from killing.
+- Hunger deals no damage in phase 1: the only exhaustion damage is dehydration. Setting `HungerStates=0` leaves hunger with no gameplay effect, and satiety band warnings are then not sent in `survival` (they remain available in `advisory`).
+- Dehydration damage exists only in `survival` mode, and `Lethal=0` prevents it from killing.
 - Well Fed buffs and similar auras do not restore the gauges. Only Food and Drink effects are credited, including food and drink items, feast or game object auras, and player-cast auras.
-- There are no global announcements and no database history for starvation or dehydration deaths; only the server log records them.
+- There are no global announcements and no database history for dehydration deaths; only the server log records them, with a `Dehydration` or `Both` cause.
 - Gauges do not decay while the character is offline.
 - Commands work in game only, not from the server console.
 - If persistence is unavailable, the affected session stays suspended even after the database recovers; a reconnect is required.

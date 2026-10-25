@@ -56,7 +56,10 @@ struct Config
     bool   PauseInBattleground     = true;
     bool   PauseInArena            = true;
     bool   ExemptGMs               = true;
-    uint32 WarningThreshold        = 25;
+    bool   HungerStates            = true;
+    double HungerStatePenaltyPct   = 10.00;
+    double HungerStarvingPenaltyPct = 30.00;
+    uint32 WarningThreshold        = 30;
     uint32 CriticalThreshold       = 10;
     double StarvingDamagePct       = 0.50;
     uint32 StarvingIntervalMs      = 10000;

@@ -4,8 +4,8 @@
 # mod-hunger-thirst
 #
 # Tracks satiety and hydration per character, warns the player as the gauges
-# fall, and optionally applies exhaustion damage from the critical band and
-# more strongly when a gauge reaches zero.
+# fall and, in survival mode, applies hunger states from the satiety gauge and
+# exhaustion damage from the hydration gauge.
 #
 # All player-facing messages (chat warnings, login summary, status command)
 # are in English.
@@ -21,22 +21,39 @@
 #     and the state persisted/queryable, but does not decay the gauges, warn,
 #     damage, or push periodic addon updates (a login snapshot with mode=0 is
 #     still sent when AddonEnable=1). "advisory" decays and warns but never
-#     damages. "survival" also damages; HungerThirst.Lethal decides whether
-#     that damage can kill.
+#     damages and never applies hunger states. "survival" adds hunger states
+#     and exhaustion damage from the hydration critical band, stronger when
+#     hydration reaches 0; HungerThirst.Lethal decides whether that damage
+#     can kill.
 #
-# Damage model in survival mode:
-#   - critical band (gauge <= CriticalThreshold) and no gauge at 0:
-#     StarvingDamagePct per StarvingIntervalMs;
-#   - at least one gauge at 0: DehydratedDamagePct per DehydratedIntervalMs;
-#   - both gauges at 0: that base percentage is multiplied once by
-#     DoubleEmptyMultiplier (the two percentages are never added together);
-#   - with Lethal=1 the hit at 0 ramps and may kill; with Lethal=0 every hit
-#     keeps at least 1 health.
+# Effects in survival mode:
+#   - Hunger states (satiety gauge, see HungerThirst.HungerStates): hunger
+#     deals no damage. Satiety at or below WarningThreshold (warning or
+#     critical band, above 0) applies spell 52749 with the penalties of
+#     HungerStatePenaltyPct; satiety at 0 applies spell 55316 with
+#     HungerStarvingPenaltyPct instead. Each state reduces movement speed and
+#     damage dealt, and increases damage taken, by its percentage. The state
+#     is removed when satiety returns to the normal band (Hysteresis
+#     applies), when HungerStates=0, or outside survival mode.
+#   - Exhaustion damage (hydration gauge only):
+#     - hydration in the critical band (0 < hydration <= CriticalThreshold):
+#       StarvingDamagePct per StarvingIntervalMs;
+#     - hydration at 0: DehydratedDamagePct per DehydratedIntervalMs;
+#     - hydration at 0 while satiety is also at 0: that base percentage is
+#       multiplied once by DoubleEmptyMultiplier (the two percentages are
+#       never added together);
+#     - with Lethal=1 the hit at 0 ramps and may kill; with Lethal=0 every
+#       hit keeps at least 1 health.
+#   - Thirst states are planned for phase 2; hydration keeps this damage-only
+#     behaviour until then.
 #
 # All changes can be applied with ".reload config"; they take effect at the
-# next tick. Exception: switching Enable from 0 to 1 does not load state for
-# players already online (it was dropped while disabled) - they must
-# reconnect or use ".hungerthirst set"; new logins are unaffected.
+# next tick. Two exceptions: HungerStatePenaltyPct and
+# HungerStarvingPenaltyPct are baked into the hunger-state spells at startup,
+# so changing them requires a server restart; and switching Enable from 0 to
+# 1 does not load state for players already online (it was dropped while
+# disabled) - they must reconnect or use ".hungerthirst set"; new logins are
+# unaffected.
 #
 # Some pauses are always active and have no configuration key: dead players,
 # characters whose state is still loading (or failed to load), and players
@@ -62,6 +79,7 @@
 # Validation performed while loading:
 #   - unknown Mode -> off (LOG_ERROR)
 #   - 0 <= CriticalThreshold < WarningThreshold <= 100
+#   - HungerStatePenaltyPct and HungerStarvingPenaltyPct clamped to 0..90
 #   - all intervals/cooldowns >= 1000 ms
 #   - all gauges/percentages/multipliers clamped to their documented range
 ########################################################################################################################
@@ -84,7 +102,8 @@ HungerThirst.Enable = 1
 #          advisory - decay, chat warnings, login summary and addon updates;
 #                     no damage even at 0/0.
 #          survival - everything advisory does, plus exhaustion damage from
-#                     the critical band, stronger at 0.
+#                     the hydration critical band, stronger when hydration
+#                     reaches 0.
 #        Case-insensitive. An unknown value falls back to "off" and logs an
 #        error.
 #        Default: off
@@ -97,27 +116,29 @@ HungerThirst.Mode = off
 #        each hit is capped so the player keeps at least 1 health, and a
 #        one-time warning is sent when that floor is reached. When 1, damage
 #        can kill; the death is recorded as a non-PvP death and the death hook
-#        receives a Starvation/Dehydration/Both cause.
+#        receives a Dehydration/Both cause (Starvation is not produced in
+#        phase 1).
 #        Default: 0
 #
 HungerThirst.Lethal = 0
 
 #
 #    HungerThirst.LethalRampPct
-#        Lethal only, while at least one gauge is at 0: additional percentage
-#        of maximum health added to the DehydratedDamagePct base for each
-#        consecutive hit (the DoubleEmptyMultiplier applies once when both are
-#        0). Capped by LethalMaxDamagePct. Clamped to 0..100.
+#        Lethal only, while hydration is at 0: additional percentage of
+#        maximum health added to the DehydratedDamagePct base for each
+#        consecutive hit (the DoubleEmptyMultiplier applies once when both
+#        gauges are at 0, so empty satiety amplifies the thirst hit). Capped
+#        by LethalMaxDamagePct. Clamped to 0..100.
 #        Default: 0.50
 #
 HungerThirst.LethalRampPct = 0.50
 
 #
 #    HungerThirst.LethalMaxDamagePct
-#        Lethal only: cap for a hit while at least one gauge is at 0, as a
-#        percentage of maximum health, ramp included. Critical-band hits
-#        without an empty gauge use StarvingDamagePct and are not capped by
-#        this value. Clamped to 0..100.
+#        Lethal only: cap for a hit while hydration is at 0, as a percentage
+#        of maximum health, ramp included. Critical-band hydration hits
+#        (hydration above 0) use StarvingDamagePct and are not capped by this
+#        value. Clamped to 0..100.
 #        Default: 5.00
 #
 HungerThirst.LethalMaxDamagePct = 5.00
@@ -198,26 +219,72 @@ HungerThirst.ExemptGMs = 1
 #    HungerThirst.WarningThreshold
 #        Upper bound of the "warning" band, in gauge points. A gauge above
 #        this value is normal; at or below it the player is hungry/thirsty.
-#        Must be <= 100 and greater than CriticalThreshold.
-#        Default: 25
+#        In survival mode this is also the satiety threshold at which the
+#        hunger state begins (see HungerThirst.HungerStates); the state is
+#        removed only when satiety returns to the normal band, Hysteresis
+#        included. Must be <= 100 and greater than CriticalThreshold.
+#        Default: 30
 #
-HungerThirst.WarningThreshold = 25
+HungerThirst.WarningThreshold = 30
 
 #
 #    HungerThirst.CriticalThreshold
 #        Upper bound of the "critical" band, in gauge points. At or below it
-#        the player is starving/dehydrated and survival damage begins; at 0
-#        the gauge is empty and damage uses the dehydrated path. Must be
-#        lower than WarningThreshold.
+#        the gauge is very low. For hydration this is when survival damage
+#        begins; hydration at 0 is empty and uses the dehydrated path.
+#        Satiety never triggers damage. Must be lower than WarningThreshold.
 #        Default: 10
 #
 HungerThirst.CriticalThreshold = 10
 
 #
+#    HungerThirst.HungerStates
+#        Survival only. When 1 (default), the satiety gauge applies a visible
+#        hunger state:
+#          - satiety at or below WarningThreshold (warning or critical band,
+#            above 0): spell 52749 "Voracious Appetite" with the penalties of
+#            HungerStatePenaltyPct;
+#          - satiety at 0: spell 55316 "Ravenous Hunger" with the penalties
+#            of HungerStarvingPenaltyPct, replacing spell 52749.
+#        Both states reduce movement speed and damage dealt, and increase
+#        damage taken, by their percentage. The state is removed when satiety
+#        returns to the normal band (Hysteresis included), outside survival
+#        mode, and when this option is 0 - hunger then has no gameplay effect
+#        at all. If either spell cannot be patched at startup, states are
+#        disabled and an error is logged.
+#        Default: 1
+#
+HungerThirst.HungerStates = 1
+
+#
+#    HungerThirst.HungerStatePenaltyPct
+#        Survival only, HungerStates=1: penalty while satiety is in the
+#        warning or critical band (above 0). Movement speed and damage dealt
+#        are reduced by this percentage; damage taken is increased by the
+#        same percentage. Clamped to 0..90.
+#        Baked into spell 52749 when the worldserver starts: changing this
+#        value requires a restart, ".reload config" is not enough.
+#        Default: 10.00
+#
+HungerThirst.HungerStatePenaltyPct = 10.00
+
+#
+#    HungerThirst.HungerStarvingPenaltyPct
+#        Survival only, HungerStates=1: penalty while satiety is at 0,
+#        replacing HungerStatePenaltyPct. Movement speed and damage dealt are
+#        reduced by this percentage; damage taken is increased by the same
+#        percentage. Clamped to 0..90.
+#        Baked into spell 55316 when the worldserver starts: changing this
+#        value requires a restart, ".reload config" is not enough.
+#        Default: 30.00
+#
+HungerThirst.HungerStarvingPenaltyPct = 30.00
+
+#
 #    HungerThirst.StarvingDamagePct
 #        Survival only: damage per hit, as a percentage of maximum health,
-#        while at least one gauge is in the critical band
-#        (0 < gauge <= CriticalThreshold) and neither gauge is at 0.
+#        while hydration is in the critical band
+#        (0 < hydration <= CriticalThreshold) and not at 0.
 #        Clamped to 0..100.
 #        Default: 0.50
 #
@@ -225,8 +292,8 @@ HungerThirst.StarvingDamagePct = 0.50
 
 #
 #    HungerThirst.StarvingIntervalMs
-#        Survival only: milliseconds between hits while a gauge is critical
-#        and neither gauge is at 0. Values below 1000 are clamped to 1000.
+#        Survival only: milliseconds between hits while hydration is critical
+#        and not at 0. Values below 1000 are clamped to 1000.
 #        Default: 10000
 #
 HungerThirst.StarvingIntervalMs = 10000
@@ -234,16 +301,16 @@ HungerThirst.StarvingIntervalMs = 10000
 #
 #    HungerThirst.DehydratedDamagePct
 #        Survival only: base damage per hit, as a percentage of maximum
-#        health, as soon as at least one gauge is at 0 (whatever the other
-#        gauge is). Clamped to 0..100.
+#        health, as soon as hydration is at 0, whatever satiety is. Clamped
+#        to 0..100.
 #        Default: 1.00
 #
 HungerThirst.DehydratedDamagePct = 1.00
 
 #
 #    HungerThirst.DehydratedIntervalMs
-#        Survival only: milliseconds between hits while at least one gauge is
-#        at 0. Values below 1000 are clamped to 1000.
+#        Survival only: milliseconds between hits while hydration is at 0.
+#        Values below 1000 are clamped to 1000.
 #        Default: 5000
 #
 HungerThirst.DehydratedIntervalMs = 5000
@@ -251,9 +318,10 @@ HungerThirst.DehydratedIntervalMs = 5000
 #
 #    HungerThirst.DoubleEmptyMultiplier
 #        Survival only: when both gauges are at 0, the DehydratedDamagePct
-#        base is multiplied by this value once. The starvation and dehydration
-#        percentages are never added together. In lethal mode the same single
-#        multiplier applies to the ramp base. Clamped to 1.00..10.00.
+#        base is multiplied by this value once, so the empty satiety gauge
+#        amplifies the thirst hit. No percentages are added together. In
+#        lethal mode the same single multiplier applies to the ramp base.
+#        Clamped to 1.00..10.00.
 #        Default: 1.50
 #
 HungerThirst.DoubleEmptyMultiplier = 1.50

@@ -26,6 +26,7 @@
 #include "Chat.h"
 #include "Config.h"
 #include "DatabaseEnv.h"
+#include "DBCStores.h"
 #include "Log.h"
 #include "Map.h"
 #include "ObjectGuid.h"
@@ -34,6 +35,7 @@
 #include "SharedDefines.h"
 #include "SpellAuras.h"
 #include "SpellInfo.h"
+#include "SpellMgr.h"
 #include "StringFormat.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
@@ -69,6 +71,72 @@ namespace HungerThirst
         constexpr double MaxGaugeValue      = 100.00;
         constexpr uint32 MaxRampTicks       = 1000;
         constexpr std::size_t MaxCachedAuras = 64;
+
+        // Blizzard spells that no content references any more, repurposed as
+        // the hunger state debuffs. They are patched on the server only; no
+        // client data is touched.
+        constexpr uint32 SpellHungerWeakenedId = 52749; // "Voracious Appetite" / frFR "Appétit vorace"
+        constexpr uint32 SpellHungerStarvingId = 55316; // "Ravenous Hunger" / frFR "Faim dévorante"
+        constexpr uint32 InfiniteDurationIndex = 21;    // SpellDuration.dbc: Duration = -1
+
+        // Reproduces the core ApplySpellFix pattern
+        // (src/server/game/Spells/SpellInfoCorrections.cpp). Spell infos are
+        // fully loaded when OnStartup runs, so patching them in place is the
+        // last write of the loading sequence.
+        bool PatchHungerStateSpell(uint32 spellId, double penaltyPct)
+        {
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (!info)
+            {
+                LOG_ERROR("module.hunger-thirst", "Spell {} not found; hunger states disabled.", spellId);
+                return false;
+            }
+
+            SpellInfo* spellInfo = const_cast<SpellInfo*>(info);
+            int32 const pct = int32(std::lround(std::clamp(penaltyPct, 0.0, 90.0)));
+
+            // Effect 0: movement speed -pct%.
+            spellInfo->Effects[0].Effect        = SPELL_EFFECT_APPLY_AURA;
+            spellInfo->Effects[0].ApplyAuraName = SPELL_AURA_MOD_DECREASE_SPEED;
+            spellInfo->Effects[0].BasePoints    = -pct;
+            spellInfo->Effects[0].MiscValue     = 0;
+            // Effect 1: damage done -pct%, all schools.
+            spellInfo->Effects[1].Effect        = SPELL_EFFECT_APPLY_AURA;
+            spellInfo->Effects[1].ApplyAuraName = SPELL_AURA_MOD_DAMAGE_PERCENT_DONE;
+            spellInfo->Effects[1].BasePoints    = -pct;
+            spellInfo->Effects[1].MiscValue     = SPELL_SCHOOL_MASK_ALL;
+            // Effect 2: damage taken +pct%, all schools ("global defense -pct%").
+            spellInfo->Effects[2].Effect        = SPELL_EFFECT_APPLY_AURA;
+            spellInfo->Effects[2].ApplyAuraName = SPELL_AURA_MOD_DAMAGE_PERCENT_TAKEN;
+            spellInfo->Effects[2].BasePoints    = pct;
+            spellInfo->Effects[2].MiscValue     = SPELL_SCHOOL_MASK_ALL;
+
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            {
+                SpellEffectInfo& effect = spellInfo->Effects[i];
+                effect.DieSides            = 0;
+                effect.RealPointsPerLevel  = 0.0f;
+                effect.PointsPerComboPoint = 0.0f;
+                effect.ValueMultiplier     = 1.0f;
+                effect.DamageMultiplier    = 1.0f;
+                effect.BonusMultiplier     = 0.0f;
+                effect.Amplitude           = 0;
+                effect.Mechanic            = MECHANIC_NONE; // freedom and immunities do not interact
+                effect.TargetA             = SpellImplicitTargetInfo(TARGET_UNIT_CASTER);
+                effect.TargetB             = SpellImplicitTargetInfo(0);
+                effect.TriggerSpell        = 0;
+                effect.ItemType            = 0;
+                effect.SpellClassMask      = flag96();
+            }
+
+            spellInfo->DurationEntry = sSpellDurationStore.LookupEntry(InfiniteDurationIndex);
+            spellInfo->AttributesCu  = SPELL_ATTR0_CU_NEGATIVE; // applied as a debuff
+
+            LOG_INFO("module.hunger-thirst",
+                "Hunger state spell {} patched (-{}% speed, -{}% damage done, +{}% damage taken).",
+                spellId, pct, pct, pct);
+            return true;
+        }
 
         struct State
         {
@@ -247,6 +315,83 @@ namespace HungerThirst
                 .SendSysMessage(Acore::StringFormat("|cffffcc00[Hunger & Thirst]|r {}", message));
         }
 
+        enum class HungerState : uint8
+        {
+            None     = 0,
+            Weakened = 1,
+            Starving = 2
+        };
+
+        // The existing bands provide the hysteresis for free: entering the
+        // warning band applies the weakened state, an empty gauge the starving
+        // one.
+        HungerState HungerStateFromBand(Band band)
+        {
+            switch (band)
+            {
+                case Band::Warning:
+                case Band::Critical:
+                    return HungerState::Weakened;
+                case Band::Empty:
+                    return HungerState::Starving;
+                case Band::Normal:
+                    break;
+            }
+
+            return HungerState::None;
+        }
+
+        void RemoveHungerStates(Player* player)
+        {
+            if (player->HasAura(SpellHungerWeakenedId))
+                player->RemoveAurasDueToSpell(SpellHungerWeakenedId);
+            if (player->HasAura(SpellHungerStarvingId))
+                player->RemoveAurasDueToSpell(SpellHungerStarvingId);
+        }
+
+        // Reconciles the auras with the desired state. Called from Tick only,
+        // so login, death, resurrection, `.reload config` and the commands are
+        // repaired on the next update (at most one tick later).
+        void ApplyHungerState(Player* player, HungerState desired, Config const& cfg)
+        {
+            bool const weakened = player->HasAura(SpellHungerWeakenedId);
+            bool const starving = player->HasAura(SpellHungerStarvingId);
+
+            switch (desired)
+            {
+                case HungerState::None:
+                    if (weakened)
+                        player->RemoveAurasDueToSpell(SpellHungerWeakenedId);
+                    if (starving)
+                        player->RemoveAurasDueToSpell(SpellHungerStarvingId);
+                    break;
+                case HungerState::Weakened:
+                    if (starving)
+                        player->RemoveAurasDueToSpell(SpellHungerStarvingId);
+                    if (!weakened)
+                    {
+                        player->AddAura(SpellHungerWeakenedId, player);
+                        SendChatLine(player, Acore::StringFormat(
+                            "Your hunger weakens you: movement speed and damage dealt reduced by {:.0f}%, "
+                            "damage taken increased by {:.0f}%.",
+                            cfg.HungerStatePenaltyPct, cfg.HungerStatePenaltyPct));
+                    }
+                    break;
+                case HungerState::Starving:
+                    if (weakened)
+                        player->RemoveAurasDueToSpell(SpellHungerWeakenedId);
+                    if (!starving)
+                    {
+                        player->AddAura(SpellHungerStarvingId, player);
+                        SendChatLine(player, Acore::StringFormat(
+                            "You are starving: movement speed and damage dealt reduced by {:.0f}%, "
+                            "damage taken increased by {:.0f}%. Eat something!",
+                            cfg.HungerStarvingPenaltyPct, cfg.HungerStarvingPenaltyPct));
+                    }
+                    break;
+            }
+        }
+
         template <typename Key>
         void PruneExpiredMap(std::map<Key, uint64>& credits, uint64 now)
         {
@@ -317,7 +462,7 @@ namespace HungerThirst
         cfg.PauseInArena = sConfigMgr->GetOption<bool>("HungerThirst.PauseInArena", true);
         cfg.ExemptGMs = sConfigMgr->GetOption<bool>("HungerThirst.ExemptGMs", true);
 
-        uint32 warningThreshold = sConfigMgr->GetOption<uint32>("HungerThirst.WarningThreshold", 25);
+        uint32 warningThreshold = sConfigMgr->GetOption<uint32>("HungerThirst.WarningThreshold", 30);
         if (warningThreshold > 100)
         {
             LOG_ERROR("module.hunger-thirst",
@@ -337,6 +482,14 @@ namespace HungerThirst
 
         cfg.WarningThreshold = warningThreshold;
         cfg.CriticalThreshold = criticalThreshold;
+
+        cfg.HungerStates = sConfigMgr->GetOption<bool>("HungerThirst.HungerStates", true);
+        cfg.HungerStatePenaltyPct = ClampRange(
+            sConfigMgr->GetOption<float>("HungerThirst.HungerStatePenaltyPct", 10.00),
+            0.00, 90.00, "HungerStatePenaltyPct");
+        cfg.HungerStarvingPenaltyPct = ClampRange(
+            sConfigMgr->GetOption<float>("HungerThirst.HungerStarvingPenaltyPct", 30.00),
+            0.00, 90.00, "HungerStarvingPenaltyPct");
 
         cfg.StarvingDamagePct = ClampRange(
             sConfigMgr->GetOption<float>("HungerThirst.StarvingDamagePct", 0.50),
@@ -612,7 +765,15 @@ namespace HungerThirst
     void Tick(Player* player, uint32 diff)
     {
         Config const& cfg = GetConfig();
-        if (!player || !cfg.Enable || cfg.CurrentMode == Mode::Off)
+        if (!player)
+            return;
+
+        // In advisory mode, or with the states disabled, the module keeps
+        // decaying and warning as before; only the state auras are removed.
+        if (!cfg.Enable || cfg.CurrentMode != Mode::Survival || !cfg.HungerStates)
+            RemoveHungerStates(player);
+
+        if (!cfg.Enable || cfg.CurrentMode == Mode::Off)
             return;
 
         if (!player->IsInWorld() || !player->IsAlive())
@@ -657,13 +818,12 @@ namespace HungerThirst
 
         char const* satietyMessage = nullptr;
         char const* hydrationMessage = nullptr;
+        HungerState desiredHungerState = HungerState::None;
         bool sendAddon = false;
         bool atOneHpWarning = false;
-        bool satietyCritical = false;
         bool hydrationCritical = false;
         bool satietyEmpty = false;
         bool hydrationEmpty = false;
-        bool anyEmpty = false;
         bool bothEmpty = false;
         uint32 damageToApply = 0;
         bool const lethal = cfg.Lethal;
@@ -695,31 +855,36 @@ namespace HungerThirst
             state.SatietyBand = ResolveBand(state.Satiety, state.SatietyBand, cfg);
             state.HydrationBand = ResolveBand(state.Hydration, state.HydrationBand, cfg);
 
-            if (state.SatietyBand > oldSatietyBand)
+            desiredHungerState = HungerStateFromBand(state.SatietyBand);
+
+            // In survival the state messages replace the satiety band warnings
+            // (no contradictory duplicate); advisory keeps them unchanged.
+            if (state.SatietyBand > oldSatietyBand && cfg.CurrentMode == Mode::Advisory)
                 satietyMessage = BandMessage(false, state.SatietyBand);
             if (state.HydrationBand > oldHydrationBand)
                 hydrationMessage = BandMessage(true, state.HydrationBand);
 
-            satietyCritical = state.Satiety <= double(cfg.CriticalThreshold);
             hydrationCritical = state.Hydration <= double(cfg.CriticalThreshold);
             satietyEmpty = state.Satiety <= MinGaugeValue;
             hydrationEmpty = state.Hydration <= MinGaugeValue;
-            anyEmpty = satietyEmpty || hydrationEmpty;
             bothEmpty = satietyEmpty && hydrationEmpty;
 
-            if (cfg.CurrentMode == Mode::Survival && (satietyCritical || hydrationCritical)
+            // Hunger no longer deals damage in phase 1: only dehydration does,
+            // with exactly its previous values. Advisory must never reach this
+            // block (the entry guard only returns in off mode).
+            if (cfg.CurrentMode == Mode::Survival && hydrationCritical
                 && !inBattleground && !inArena)
             {
                 // The warning flag is only re-armed when the critical
                 // situation ends (else branch) or a food/drink credit lands,
                 // so health regeneration does not repeat the message.
 
-                // The lethal ramp only advances while at least one gauge is
-                // actually empty; a critical-but-nonzero gauge does not ramp.
-                if (!anyEmpty)
+                // The lethal ramp only advances while hydration is actually
+                // empty; a critical-but-nonzero gauge does not ramp.
+                if (!hydrationEmpty)
                     state.RampTicks = 0;
 
-                uint32 const interval = anyEmpty ? cfg.DehydratedIntervalMs : cfg.StarvingIntervalMs;
+                uint32 const interval = hydrationEmpty ? cfg.DehydratedIntervalMs : cfg.StarvingIntervalMs;
 
                 state.DamageTimerMs += effectiveDiff;
                 if (state.DamageTimerMs >= interval)
@@ -728,11 +893,11 @@ namespace HungerThirst
                     // so the cadence stays honest across short updates.
                     state.DamageTimerMs -= interval;
 
-                    double pct = anyEmpty ? cfg.DehydratedDamagePct : cfg.StarvingDamagePct;
+                    double pct = hydrationEmpty ? cfg.DehydratedDamagePct : cfg.StarvingDamagePct;
                     if (bothEmpty)
                         pct *= cfg.DoubleEmptyMultiplier;
 
-                    if (lethal && anyEmpty)
+                    if (lethal && hydrationEmpty)
                     {
                         pct = (cfg.DehydratedDamagePct + cfg.LethalRampPct * double(state.RampTicks)) *
                             (bothEmpty ? cfg.DoubleEmptyMultiplier : 1.00);
@@ -794,18 +959,19 @@ namespace HungerThirst
         if (hydrationMessage)
             SendChatLine(player, hydrationMessage);
 
+        // Only reconcile while the states are actually active: otherwise the
+        // aura would be re-applied right after the entry guard removed it.
+        if (cfg.CurrentMode == Mode::Survival && cfg.HungerStates)
+            ApplyHungerState(player, desiredHungerState, cfg);
+
         if (atOneHpWarning)
             SendChatLine(player,
-                "You are at 1 health because of hunger and thirst. "
-                "Eat and drink immediately!");
+                "You are at 1 health because of dehydration. "
+                "Drink something immediately!");
 
         if (damageToApply > 0)
         {
-            DeathCause const cause = bothEmpty ? DeathCause::Both
-                : satietyEmpty ? DeathCause::Starvation
-                : hydrationEmpty ? DeathCause::Dehydration
-                : satietyCritical ? DeathCause::Starvation
-                : DeathCause::Dehydration;
+            DeathCause const cause = bothEmpty ? DeathCause::Both : DeathCause::Dehydration;
 
             // Set before applying: a lethal hit runs the unit death hook
             // synchronously from inside EnvironmentalDamage, and that hook
@@ -1012,9 +1178,11 @@ namespace HungerThirst
 
         // A GM jump can land directly inside a warning band without Tick
         // observing the crossing, so emit the corresponding warning once.
+        // Satiety band warnings are advisory-only in phase 1: in survival the
+        // state message of the next Tick informs the player.
         if (cfg.CurrentMode != Mode::Off)
         {
-            if (satietyBand >= Band::Warning)
+            if (cfg.CurrentMode == Mode::Advisory && satietyBand >= Band::Warning)
             {
                 if (char const* message = BandMessage(false, satietyBand))
                     SendChatLine(player, message);
@@ -1130,7 +1298,8 @@ namespace HungerThirst
             snapshot.Satiety, BandName(snapshot.SatietyBand, false),
             snapshot.Hydration, BandName(snapshot.HydrationBand, true));
 
-        if (snapshot.SatietyBand >= Band::Critical)
+        // In survival the state message of the next Tick informs the player.
+        if (cfg.CurrentMode == Mode::Advisory && snapshot.SatietyBand >= Band::Critical)
         {
             if (char const* message = BandMessage(false, snapshot.SatietyBand))
                 SendChatLine(player, message);
@@ -1287,6 +1456,16 @@ public:
     void OnStartup() override
     {
         HungerThirst::EnsureSchema();
+
+        // Patch the state spells unconditionally: a later `.reload config`
+        // enabling the states must never apply the original client spells.
+        // The percentages are baked into the auras here, so changing them
+        // requires a restart.
+        HungerThirst::Config& cfg = HungerThirst::GetConfig();
+        if (!HungerThirst::PatchHungerStateSpell(HungerThirst::SpellHungerWeakenedId, cfg.HungerStatePenaltyPct)
+            || !HungerThirst::PatchHungerStateSpell(HungerThirst::SpellHungerStarvingId,
+                cfg.HungerStarvingPenaltyPct))
+            cfg.HungerStates = false; // fail safe: no states rather than wrong states
     }
 };
 
