@@ -689,7 +689,7 @@ local AURA_TOOLTIPS = {
                 "l'état affaibli ; une seconde bouchée sort des deux.",
         },
     },
-    [46583] = {
+    [25696] = {
         title = "Soif — Très soif",
         lines = {
             "Régénération de mana (Esprit) : -10 % par défaut",
@@ -716,7 +716,9 @@ local AURA_TOOLTIPS = {
 local AURA_TOOLTIPS_BY_NAME = {
     ["Voracious Appetite"] = AURA_TOOLTIPS[52749],
     ["Ravenous Hunger"] = AURA_TOOLTIPS[55316],
-    ["Cosmetic - Drink"] = AURA_TOOLTIPS[46583],
+    ["Cosmetic - Drink"] = AURA_TOOLTIPS[25696],
+    ["Drink"] = AURA_TOOLTIPS[25696],
+    ["Boisson"] = AURA_TOOLTIPS[25696],
     ["Drunken Stupor"] = AURA_TOOLTIPS[14870],
 }
 
