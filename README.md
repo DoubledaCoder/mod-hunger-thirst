@@ -182,13 +182,14 @@ In `survival` mode with `HungerStates=1`, the satiety band drives a visible debu
 
 ### Thirst states
 
-In `survival` mode with `ThirstStates=1`, the hydration band drives a second visible debuff family. Like the hunger states, it reuses two Blizzard spells that ship with the 3.3.5a client and are otherwise unused, and patches their server-side spell data in memory at startup. No client patch, MPQ or DBC change is involved.
+In `survival` mode with `ThirstStates=1`, the hydration band drives a second visible debuff family. Like the hunger states, it reuses two client-visible Blizzard spells that ship with the 3.3.5a client and are otherwise unused, and patches their server-side spell data in memory at startup. No client patch, MPQ or DBC change is involved.
 
 | State | Hydration | Spell ID | Name (enUS) | Icon | Effects |
 |---|---|---|---|---|---|
-| Thirsty | above 0 and at or below `WarningThreshold` (warning or critical band, 30 by default) | 43155 | Drink | `INV_Drink_07` | Mana regeneration -`ThirstStatePenaltyPct`%, magical damage done -`ThirstStatePenaltyPct`%, healing done -`ThirstStatePenaltyPct`% (10% by default) |
-| Dehydrated | 0 | 14869 | Drunken Stupor | `INV_Drink_04` | Mana regeneration -`ThirstDehydratedPenaltyPct`%, magical damage done -`ThirstDehydratedPenaltyPct`%, healing done -`ThirstDehydratedPenaltyPct`% (30% by default) |
+| Thirsty | above 0 and at or below `WarningThreshold` (warning or critical band, 30 by default) | 46583 | Cosmetic - Drink | `INV_Drink_18` | Mana regeneration -`ThirstStatePenaltyPct`%, magical damage done -`ThirstStatePenaltyPct`%, healing done -`ThirstStatePenaltyPct`% (10% by default) |
+| Dehydrated | 0 | 14870 | Drunken Stupor | `INV_Drink_04` | Mana regeneration -`ThirstDehydratedPenaltyPct`%, magical damage done -`ThirstDehydratedPenaltyPct`%, healing done -`ThirstDehydratedPenaltyPct`% (30% by default) |
 
+- Earlier module versions used 43155 ("Drink") and 14869 ("Drunken Stupor") for these states. The stock client hides both: 43155 carries `SPELL_ATTR0_DO_NOT_DISPLAY` and 14869 is passive, so no thirst icon appeared. Those legacy IDs are no longer applied; their auras are removed automatically from a character that still carries them, before the current state aura is reconciled, and whenever the thirst states are removed.
 - A single thirst state is active at a time. The state is selected from the hydration band with the same band and hysteresis logic as the gauges: thirsty starts as soon as hydration enters the warning band and ends when the band returns to normal (strictly above `WarningThreshold + Hysteresis`, 32 by default); dehydrated starts at 0 and replaces thirsty, and ends as soon as hydration rises above 0. At the default values, one standard drink restores 35 hydration, which is above 32, so a single drink can clear the state outright.
 - Thirst states exist only in `survival` with `ThirstStates=1`. `advisory` and `off` never apply a state or a blur, and `ThirstStates=0` removes both at the next tick; in those cases hydration keeps its band labels but has no gameplay effect. `advisory` keeps the hydration band warnings that `survival` replaces with the state chat line.
 - Entering a state applies an infinite-duration aura and sends exactly one English chat line with the real percentages, never once per tick:
@@ -287,7 +288,7 @@ Without the addon, everything remains functional through chat warnings, the hung
 ## Compatibility
 
 - The module is server-side. It needs no client patch, no custom MPQ, no custom texture and no SQL import.
-- The hunger states reuse two spells shipped with the stock 3.3.5a client, 52749 ("Voracious Appetite") and 55316 ("Ravenous Hunger"), and the thirst states reuse 43155 ("Drink") and 14869 ("Drunken Stupor"). No core content uses them. Their server-side spell data is patched in memory at `worldserver` startup; no DBC file, MPQ, client file or core source file is modified.
+- The hunger states reuse two spells shipped with the stock 3.3.5a client, 52749 ("Voracious Appetite") and 55316 ("Ravenous Hunger"), and the thirst states reuse 46583 ("Cosmetic - Drink") and 14870 ("Drunken Stupor"). No core content uses them. Their server-side spell data is patched in memory at `worldserver` startup; no DBC file, MPQ, client file or core source file is modified. The thirst spells used by earlier versions, 43155 and 14869, are no longer applied; their auras are removed automatically from characters that still carry them.
 - The mana-regeneration penalty relies on the canonical `SPELL_AURA_MOD_POWER_REGEN_PERCENT` aura only. No core patch is applied, so only the spirit-based regeneration portion is reduced; flat mana-per-5-seconds regeneration keeps its full value.
 - It uses public AzerothCore script hooks (world configuration and startup, player load/login/update/save/logout/delete, and aura apply) and its own `hunger_thirst_state` table. No core file is modified.
 - The configuration namespace (`HungerThirst.*`), the command (`.hungerthirst`) and the addon prefix (`HT`) are module-specific, so the module can be installed alongside other standalone modules.

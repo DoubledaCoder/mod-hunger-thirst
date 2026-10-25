@@ -81,12 +81,22 @@ namespace HungerThirst
         constexpr int32  ThirstBlurValueDehydrated   = 60;
 
         // Blizzard spells that no content references any more, repurposed as
-        // the hunger state debuffs. They are patched on the server only; no
-        // client data is touched.
+        // the hunger and thirst state debuffs. They are patched on the server
+        // only; no client data is touched. The thirst spells must be visible
+        // to the client: the earlier 43155 carries
+        // SPELL_ATTR0_DO_NOT_DISPLAY and 14869 is passive, so real clients
+        // showed no thirst icon for them.
         constexpr uint32 SpellHungerWeakenedId = 52749; // "Voracious Appetite" / frFR "Appétit vorace"
         constexpr uint32 SpellHungerStarvingId = 55316; // "Ravenous Hunger" / frFR "Faim dévorante"
-        constexpr uint32 SpellThirstyId        = 43155; // "Drink"
-        constexpr uint32 SpellDehydratedId     = 14869; // "Drunken Stupor"
+        constexpr uint32 SpellThirstyId        = 46583; // "Cosmetic - Drink", icon INV_Drink_18
+        constexpr uint32 SpellDehydratedId     = 14870; // "Drunken Stupor", icon INV_Drink_04
+
+        // Thirst spells used by earlier module versions. They are no longer
+        // patched or applied; these constants exist only so the auras they
+        // left on characters can be cleaned up (legacy aura cleanup).
+        constexpr uint32 SpellThirstyLegacyId    = 43155; // old "Drink", client-hidden
+        constexpr uint32 SpellDehydratedLegacyId = 14869; // old "Drunken Stupor", passive
+
         constexpr uint32 InfiniteDurationIndex = 21;    // SpellDuration.dbc: Duration = -1
 
         // Reproduces the core ApplySpellFix pattern
@@ -143,9 +153,8 @@ namespace HungerThirst
             spellInfo->AttributesCu  = SPELL_ATTR0_CU_NEGATIVE; // applied as a debuff
             spellInfo->Attributes   &= ~SPELL_ATTR0_PASSIVE;    // passive auras are not sent to the client
 
-            // Repurposed spells may carry Blizzard interrupt flags (43155
-            // interrupts on movement or damage); the state aura must stay
-            // until the module removes it.
+            // The repurposed spells may carry Blizzard interrupt flags; the
+            // state aura must stay until the module removes it.
             spellInfo->InterruptFlags        = 0;
             spellInfo->AuraInterruptFlags    = 0;
             spellInfo->ChannelInterruptFlags = 0;
@@ -210,9 +219,9 @@ namespace HungerThirst
             spellInfo->AttributesCu  = SPELL_ATTR0_CU_NEGATIVE; // applied as a debuff
             spellInfo->Attributes   &= ~SPELL_ATTR0_PASSIVE;    // passive auras are not sent to the client
 
-            // Repurposed spells may carry Blizzard interrupt flags (43155
-            // interrupts on movement or damage); the state aura must stay
-            // until the module removes it.
+            // Repurposed spells may carry Blizzard interrupt flags (the
+            // thirst spell 46583 interrupts on movement or damage); the state
+            // aura must stay until the module removes it.
             spellInfo->InterruptFlags        = 0;
             spellInfo->AuraInterruptFlags    = 0;
             spellInfo->ChannelInterruptFlags = 0;
@@ -623,10 +632,26 @@ namespace HungerThirst
             }
         }
 
+        // Removes the thirst auras applied by earlier module versions. The
+        // current state spells are 46583 ("Cosmetic - Drink", thirsty) and
+        // 14870 ("Drunken Stupor", dehydrated); the legacy spells 43155 and
+        // 14869 are never applied again. Called before the state is
+        // reconciled and when it is removed, so a character that still
+        // carries a legacy aura is cleaned up on the next active tick.
+        void RemoveLegacyThirstAuras(Player* player)
+        {
+            if (player->HasAura(SpellThirstyLegacyId))
+                player->RemoveAurasDueToSpell(SpellThirstyLegacyId);
+            if (player->HasAura(SpellDehydratedLegacyId))
+                player->RemoveAurasDueToSpell(SpellDehydratedLegacyId);
+        }
+
         void RemoveThirstStates(Player* player)
         {
             if (!player)
                 return;
+
+            RemoveLegacyThirstAuras(player);
 
             if (player->HasAura(SpellThirstyId))
                 player->RemoveAurasDueToSpell(SpellThirstyId);
@@ -640,6 +665,10 @@ namespace HungerThirst
         // carrying the configured penalty. Called from Tick only.
         void ApplyThirstState(Player* player, ThirstState desired, Config const& cfg)
         {
+            // Characters updated from an earlier module version may still
+            // carry 43155/14869; drop them before adding a current aura.
+            RemoveLegacyThirstAuras(player);
+
             bool const thirsty = player->HasAura(SpellThirstyId);
             bool const dehydrated = player->HasAura(SpellDehydratedId);
 

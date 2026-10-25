@@ -36,13 +36,16 @@
 #     applies), when HungerStates=0, or outside survival mode.
 #   - Thirst states (hydration gauge, see HungerThirst.ThirstStates): thirst
 #     deals no damage. Hydration at or below WarningThreshold (warning or
-#     critical band, above 0) applies spell 43155 with the penalties of
-#     ThirstStatePenaltyPct; hydration at 0 applies spell 14869 with
-#     ThirstDehydratedPenaltyPct instead. Each state reduces mana
-#     regeneration, magical damage done and healing done by its percentage;
-#     physical, ranged and pet damage are unaffected, and so is damage
-#     taken. The state is removed when hydration returns to the normal band
-#     (Hysteresis included), when ThirstStates=0, or outside survival mode.
+#     critical band, above 0) applies spell 46583 "Cosmetic - Drink" with the
+#     penalties of ThirstStatePenaltyPct; hydration at 0 applies spell 14870
+#     "Drunken Stupor" with ThirstDehydratedPenaltyPct instead. Each state
+#     reduces mana regeneration, magical damage done and healing done by its
+#     percentage; physical, ranged and pet damage are unaffected, and so is
+#     damage taken. The state is removed when hydration returns to the normal
+#     band (Hysteresis included), when ThirstStates=0, or outside survival
+#     mode. The thirst spells of earlier module versions, 43155 and 14869,
+#     are no longer applied; their auras are removed automatically from
+#     characters that still carry them.
 #   - Mana regeneration: the canonical
 #     SPELL_AURA_MOD_POWER_REGEN_PERCENT aura is used, which in this core
 #     only scales spirit-based regeneration. Flat mp5 regeneration is not
@@ -213,8 +216,8 @@ HungerThirst.WarningThreshold = 30
 #    HungerThirst.CriticalThreshold
 #        Upper bound of the "critical" band, in gauge points. At or below it
 #        the gauge is very low. Survival thirst treats the warning and
-#        critical bands the same (state 1, spell 43155); hydration at 0 is
-#        empty and uses state 2 (spell 14869). Satiety never uses this band
+#        critical bands the same (state 1, spell 46583); hydration at 0 is
+#        empty and uses state 2 (spell 14870). Satiety never uses this band
 #        beyond the warning state. Also used for band labels and advisory
 #        warnings. Must be lower than WarningThreshold.
 #        Default: 10
@@ -269,10 +272,10 @@ HungerThirst.HungerStarvingPenaltyPct = 30.00
 #        Survival only. When 1 (default), the hydration gauge applies a
 #        visible thirst state:
 #          - hydration at or below WarningThreshold (warning or critical
-#            band, above 0): spell 43155 "Drink" with the penalties of
-#            ThirstStatePenaltyPct;
-#          - hydration at 0: spell 14869 "Drunken Stupor" with the penalties
-#            of ThirstDehydratedPenaltyPct, replacing spell 43155.
+#            band, above 0): spell 46583 "Cosmetic - Drink" with the
+#            penalties of ThirstStatePenaltyPct;
+#          - hydration at 0: spell 14870 "Drunken Stupor" with the penalties
+#            of ThirstDehydratedPenaltyPct, replacing spell 46583.
 #        Both states reduce mana regeneration, magical damage done and
 #        healing done by their percentage. Physical, ranged and pet damage
 #        are unaffected, and so is damage taken. The state is removed when
@@ -281,7 +284,9 @@ HungerThirst.HungerStarvingPenaltyPct = 30.00
 #        gameplay effect at all. If either spell cannot be patched at
 #        startup, states are disabled and an error is logged. The two spells
 #        keep their Blizzard names and icons; the chat message sent when the
-#        state begins is the authoritative description.
+#        state begins is the authoritative description. Auras of the older
+#        thirst spells 43155 and 14869 are removed automatically from
+#        characters that still carry them.
 #        Default: 1
 #
 HungerThirst.ThirstStates = 1
@@ -292,7 +297,7 @@ HungerThirst.ThirstStates = 1
 #        warning or critical band (above 0). Mana regeneration (spirit-based
 #        regeneration only, see the header), magical damage done and healing
 #        done are reduced by this percentage. Clamped to 0..90.
-#        Baked into spell 43155 when the worldserver starts: changing this
+#        Baked into spell 46583 when the worldserver starts: changing this
 #        value requires a restart, ".reload config" is not enough.
 #        Default: 10.00
 #
@@ -304,7 +309,7 @@ HungerThirst.ThirstStatePenaltyPct = 10.00
 #        replacing ThirstStatePenaltyPct. Mana regeneration (spirit-based
 #        regeneration only, see the header), magical damage done and healing
 #        done are reduced by this percentage. Clamped to 0..90.
-#        Baked into spell 14869 when the worldserver starts: changing this
+#        Baked into spell 14870 when the worldserver starts: changing this
 #        value requires a restart, ".reload config" is not enough.
 #        Default: 30.00
 #
