@@ -76,9 +76,12 @@ namespace HungerThirst
         // every interval; no aura and no gameplay effect. The intensities stay
         // below the client's drunk threshold (50), where the field only tints
         // the screen (tipsy): at 50 and above the client switches to its drunk
-        // stance and walk/slide animation. The original dehydrated intensity
-        // (60) crossed that threshold and produced the sliding walk reported
-        // on a real client; the shipped value is 45.
+        // stance and walk animation. The blur is visual only and was never the
+        // cause of the "sliding walk" reported on a real client: the character
+        // slid because of the old dehydrated state spell 14870 (now retired),
+        // whose stock client data is a stun, so the client played the stunned
+        // stand animation while the server let the character move (see the
+        // spell list below).
         constexpr uint32 ThirstBlurIntervalDefaultMs = 10000;
         constexpr uint32 ThirstBlurDurationDefaultMs = 2000;
         constexpr uint32 MinBlurDurationMs           = 100;
@@ -92,17 +95,26 @@ namespace HungerThirst
         // no SPELL_ATTR0_DO_NOT_DISPLAY and no SPELL_ATTR1_NO_AURA_ICON (the
         // legacy spells 43155 and 46583 each carry one of these, so real
         // clients showed no thirst icon for them).
+        // The client also keeps rendering the stock effect of a repurposed
+        // spell even though its server data is patched, so that effect must
+        // not play an animation. 5909 carries Effect 6 + SPELL_AURA_MOD_STAT
+        // (no animation, no stance); 14870, the retired spell used before it,
+        // carries Effect 6 + SPELL_AURA_MOD_STUN, which froze the client into
+        // the stunned stand animation while the server let the character
+        // move: that mismatch is the "sliding walk" seen on a real client.
         constexpr uint32 SpellHungerWeakenedId = 52749; // "Voracious Appetite" / frFR "Appétit vorace"
         constexpr uint32 SpellHungerStarvingId = 55316; // "Ravenous Hunger" / frFR "Faim dévorante"
         constexpr uint32 SpellThirstyId        = 25696; // "Drink" / frFR "Boisson", icon INV_Drink_07
-        constexpr uint32 SpellDehydratedId     = 14870; // "Drunken Stupor", icon INV_Drink_04
+        constexpr uint32 SpellDehydratedId     = 5909;  // "Watered-down Beer", icon INV_Drink_04
 
         // Thirst spells used by earlier module versions. They are no longer
         // patched or applied; these constants exist only so the auras they
-        // left on characters can be cleaned up (legacy aura cleanup).
-        constexpr uint32 SpellThirstyLegacyId    = 43155; // old "Drink", client-hidden
-        constexpr uint32 SpellThirstyLegacyId2   = 46583; // "Cosmetic - Drink", SPELL_ATTR1_NO_AURA_ICON
-        constexpr uint32 SpellDehydratedLegacyId = 14869; // old "Drunken Stupor", passive
+        // left on characters can be cleaned up (legacy aura cleanup). 14870
+        // is retired because of its client-side stun (see above).
+        constexpr uint32 SpellThirstyLegacyId     = 43155; // old "Drink", client-hidden
+        constexpr uint32 SpellThirstyLegacyId2    = 46583; // "Cosmetic - Drink", SPELL_ATTR1_NO_AURA_ICON
+        constexpr uint32 SpellDehydratedLegacyId  = 14869; // old "Drunken Stupor", passive
+        constexpr uint32 SpellDehydratedLegacyId2 = 14870; // old "Drunken Stupor", client-side stun (sliding walk)
 
         constexpr uint32 InfiniteDurationIndex = 21;    // SpellDuration.dbc: Duration = -1
 
@@ -639,12 +651,13 @@ namespace HungerThirst
         }
 
         // Removes the thirst auras applied by earlier module versions. The
-        // current state spells are 25696 ("Drink", thirsty) and 14870
-        // ("Drunken Stupor", dehydrated); the legacy spells 43155, 46583 and
-        // 14869 are never applied again (43155 and 46583 are hidden by the
-        // client, 14869 is passive). Called before the state is reconciled
-        // and when it is removed, so a character that still carries a legacy
-        // aura is cleaned up on the next active tick.
+        // current state spells are 25696 ("Drink", thirsty) and 5909
+        // ("Watered-down Beer", dehydrated); the legacy spells 43155, 46583,
+        // 14869 and 14870 are never applied again (43155 and 46583 are hidden
+        // by the client, 14869 is passive, 14870 is a client-side stun).
+        // Called before the state is reconciled and when it is removed, so a
+        // character that still carries a legacy aura is cleaned up on the
+        // next active tick.
         void RemoveLegacyThirstAuras(Player* player)
         {
             if (player->HasAura(SpellThirstyLegacyId))
@@ -653,6 +666,8 @@ namespace HungerThirst
                 player->RemoveAurasDueToSpell(SpellThirstyLegacyId2);
             if (player->HasAura(SpellDehydratedLegacyId))
                 player->RemoveAurasDueToSpell(SpellDehydratedLegacyId);
+            if (player->HasAura(SpellDehydratedLegacyId2))
+                player->RemoveAurasDueToSpell(SpellDehydratedLegacyId2);
         }
 
         void RemoveThirstStates(Player* player)
@@ -675,7 +690,8 @@ namespace HungerThirst
         void ApplyThirstState(Player* player, ThirstState desired, Config const& cfg)
         {
             // Characters updated from an earlier module version may still
-            // carry 43155/46583/14869; drop them before adding a current aura.
+            // carry one of the legacy auras 43155/46583/14869/14870; drop it
+            // before adding a current aura.
             RemoveLegacyThirstAuras(player);
 
             bool const thirsty = player->HasAura(SpellThirstyId);

@@ -37,15 +37,15 @@
 #   - Thirst states (hydration gauge, see HungerThirst.ThirstStates): thirst
 #     deals no damage. Hydration at or below WarningThreshold (warning or
 #     critical band, above 0) applies spell 25696 "Drink" with the
-#     penalties of ThirstStatePenaltyPct; hydration at 0 applies spell 14870
-#     "Drunken Stupor" with ThirstDehydratedPenaltyPct instead. Each state
+#     penalties of ThirstStatePenaltyPct; hydration at 0 applies spell 5909
+#     "Watered-down Beer" with ThirstDehydratedPenaltyPct instead. Each state
 #     reduces mana regeneration, magical damage done and healing done by its
 #     percentage; physical, ranged and pet damage are unaffected, and so is
 #     damage taken. The state is removed when hydration returns to the normal
 #     band (Hysteresis included), when ThirstStates=0, or outside survival
-#     mode. The thirst spells of earlier module versions, 43155, 46583 and
-#     14869, are no longer applied; their auras are removed automatically
-#     from characters that still carry them.
+#     mode. The legacy thirst spells of earlier module versions, 43155,
+#     46583, 14869 and 14870, are no longer applied; their auras are
+#     removed automatically from characters that still carry them.
 #   - Mana regeneration: the canonical
 #     SPELL_AURA_MOD_POWER_REGEN_PERCENT aura is used, which in this core
 #     only scales spirit-based regeneration. Flat mp5 regeneration is not
@@ -57,10 +57,14 @@
 #     fake inebriation player field (PLAYER_FAKE_INEBRIATION): no aura, no
 #     icon and no gameplay effect. Both intensities stay below the client's
 #     drunk threshold (50), so the field only tints the screen and never
-#     switches the client to the drunk stance with its sliding walk
-#     animation. The original dehydrated intensity (60) crossed that
-#     threshold and caused the sliding walk on a real client; the shipped
-#     value is 45.
+#     switches the client to the drunk stance and its unsteady walk
+#     animation. The blur is visual only and is not what caused the sliding
+#     walk reported on a real client: the character slid because the retired
+#     dehydrated state spell 14870 has a stun in the stock client data, so
+#     the client played the stunned stand animation while the server let the
+#     character move. The current dehydrated spell, 5909, carries the same
+#     icon (INV_Drink_04) but a stat aura on the client, which plays no
+#     animation.
 #     No pulse is sent while a pause applies (see below) or once the state
 #     ends; a pulse in progress is cleared.
 #   - No exhaustion damage: thirst never removes health, and the module never
@@ -222,7 +226,7 @@ HungerThirst.WarningThreshold = 30
 #        Upper bound of the "critical" band, in gauge points. At or below it
 #        the gauge is very low. Survival thirst treats the warning and
 #        critical bands the same (state 1, spell 25696); hydration at 0 is
-#        empty and uses state 2 (spell 14870). Satiety never uses this band
+#        empty and uses state 2 (spell 5909). Satiety never uses this band
 #        beyond the warning state. Also used for band labels and advisory
 #        warnings. Must be lower than WarningThreshold.
 #        Default: 10
@@ -279,8 +283,8 @@ HungerThirst.HungerStarvingPenaltyPct = 30.00
 #          - hydration at or below WarningThreshold (warning or critical
 #            band, above 0): spell 25696 "Drink" with the
 #            penalties of ThirstStatePenaltyPct;
-#          - hydration at 0: spell 14870 "Drunken Stupor" with the penalties
-#            of ThirstDehydratedPenaltyPct, replacing spell 25696.
+#          - hydration at 0: spell 5909 "Watered-down Beer" with the
+#            penalties of ThirstDehydratedPenaltyPct, replacing spell 25696.
 #        Both states reduce mana regeneration, magical damage done and
 #        healing done by their percentage. Physical, ranged and pet damage
 #        are unaffected, and so is damage taken. The state is removed when
@@ -294,9 +298,9 @@ HungerThirst.HungerStarvingPenaltyPct = 30.00
 #        patch: the chat message sent when the state begins is the
 #        authoritative description, and the optional client addon overrides
 #        the tooltips of all four state auras with the real effects and the
-#        remedy (eat or drink). Auras of the older thirst spells 43155,
-#        46583 and 14869 are removed automatically from characters that
-#        still carry them.
+#        remedy (eat or drink). Auras of the legacy thirst spells 43155,
+#        46583, 14869 and 14870 are removed automatically from characters
+#        that still carry them.
 #        Default: 1
 #
 HungerThirst.ThirstStates = 1
@@ -319,7 +323,7 @@ HungerThirst.ThirstStatePenaltyPct = 10.00
 #        replacing ThirstStatePenaltyPct. Mana regeneration (spirit-based
 #        regeneration only, see the header), magical damage done and healing
 #        done are reduced by this percentage. Clamped to 0..90.
-#        Baked into spell 14870 when the worldserver starts: changing this
+#        Baked into spell 5909 when the worldserver starts: changing this
 #        value requires a restart, ".reload config" is not enough.
 #        Default: 30.00
 #
@@ -345,8 +349,8 @@ HungerThirst.ThirstBlurIntervalMs = 10000
 #        milliseconds. The intensity is 35 while hydration is in the warning
 #        or critical band (state 1) and 45 at 0 (state 2). Both values are
 #        below the client's drunk threshold (50): the field is visual only
-#        and does not put the character into the drunk stance or its sliding
-#        walk animation. Values below 100 are clamped to 100.
+#        and does not put the character into the drunk stance and its
+#        unsteady walk animation. Values below 100 are clamped to 100.
 #        Default: 2000
 #
 HungerThirst.ThirstBlurDurationMs = 2000

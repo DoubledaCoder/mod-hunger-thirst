@@ -699,7 +699,7 @@ local AURA_TOOLTIPS = {
             "Remède : bois pour repasser au-dessus de 32 % d'hydratation (30 % + 2, valeurs par défaut).",
         },
     },
-    [14870] = {
+    [5909] = {
         title = "Soif — Déshydraté",
         lines = {
             "Régénération de mana (Esprit) : -30 % par défaut",
@@ -711,6 +711,10 @@ local AURA_TOOLTIPS = {
     },
 }
 
+-- 14870 ("Drunken Stupor") is the retired dehydrated spell, replaced by 5909
+-- ("Watered-down Beer"); its stock client effect is a stun and the module strips it.
+AURA_TOOLTIPS[14870] = AURA_TOOLTIPS[5909]
+
 -- UnitAura returns the spell ID as its 11th value; this fallback covers
 -- clients that omit it and matches the English aura names.
 local AURA_TOOLTIPS_BY_NAME = {
@@ -719,7 +723,8 @@ local AURA_TOOLTIPS_BY_NAME = {
     ["Cosmetic - Drink"] = AURA_TOOLTIPS[25696],
     ["Drink"] = AURA_TOOLTIPS[25696],
     ["Boisson"] = AURA_TOOLTIPS[25696],
-    ["Drunken Stupor"] = AURA_TOOLTIPS[14870],
+    ["Drunken Stupor"] = AURA_TOOLTIPS[5909],
+    ["Watered-down Beer"] = AURA_TOOLTIPS[5909],
 }
 
 if GameTooltip and GameTooltip.SetUnitAura then
