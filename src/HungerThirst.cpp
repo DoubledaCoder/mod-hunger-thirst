@@ -73,12 +73,15 @@ namespace HungerThirst
         constexpr std::size_t MaxCachedAuras = 64;
 
         // Thirst blur: pulse the public client drunk field for a short while
-        // every interval; no aura and no gameplay effect.
+        // every interval; no aura and no gameplay effect. The intensities stay
+        // below the client's drunk threshold (50), where the field only tints
+        // the screen (tipsy): at 50 and above the client switches to its drunk
+        // stance and walk/slide animation.
         constexpr uint32 ThirstBlurIntervalDefaultMs = 10000;
         constexpr uint32 ThirstBlurDurationDefaultMs = 2000;
         constexpr uint32 MinBlurDurationMs           = 100;
         constexpr int32  ThirstBlurValueThirsty      = 35;
-        constexpr int32  ThirstBlurValueDehydrated   = 60;
+        constexpr int32  ThirstBlurValueDehydrated   = 45;
 
         // Blizzard spells that no content references any more, repurposed as
         // the hunger and thirst state debuffs. They are patched on the server
@@ -613,7 +616,7 @@ namespace HungerThirst
                         player->AddAura(SpellHungerWeakenedId, player);
                         SendChatLine(player, Acore::StringFormat(
                             "Your hunger weakens you: movement speed and damage dealt reduced by {:.0f}%, "
-                            "damage taken increased by {:.0f}%.",
+                            "damage taken increased by {:.0f}%. Eat something.",
                             cfg.HungerStatePenaltyPct, cfg.HungerStatePenaltyPct));
                     }
                     break;
@@ -692,7 +695,7 @@ namespace HungerThirst
                         else
                             SendChatLine(player, Acore::StringFormat(
                                 "Your thirst weakens you: mana regeneration and spell effectiveness "
-                                "reduced by {:.0f}%.",
+                                "reduced by {:.0f}%. Drink something.",
                                 cfg.ThirstStatePenaltyPct));
                     }
                     break;

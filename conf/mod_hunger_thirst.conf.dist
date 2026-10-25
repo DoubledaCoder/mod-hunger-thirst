@@ -53,9 +53,12 @@
 #   - Thirst blur (see ThirstBlurIntervalMs/ThirstBlurDurationMs): while a
 #     thirst state is active, a client-side blur pulses for
 #     ThirstBlurDurationMs every ThirstBlurIntervalMs (2 s every 10 s by
-#     default) with intensity 35 for state 1 and 60 for state 2. It uses the
+#     default) with intensity 35 for state 1 and 45 for state 2. It uses the
 #     fake inebriation player field (PLAYER_FAKE_INEBRIATION): no aura, no
-#     icon and no gameplay effect.
+#     icon and no gameplay effect. Both intensities stay below the client's
+#     drunk threshold (50), so the field only tints the screen and never
+#     switches the client to the drunk stance with its sliding walk
+#     animation.
 #     No pulse is sent while a pause applies (see below) or once the state
 #     ends; a pulse in progress is cleared.
 #   - No exhaustion damage: thirst never removes health, and the module never
@@ -282,11 +285,16 @@ HungerThirst.HungerStarvingPenaltyPct = 30.00
 #        hydration returns to the normal band (Hysteresis included), outside
 #        survival mode, and when this option is 0 - thirst then has no
 #        gameplay effect at all. If either spell cannot be patched at
-#        startup, states are disabled and an error is logged. The two spells
-#        keep their Blizzard names and icons; the chat message sent when the
-#        state begins is the authoritative description. Auras of the older
-#        thirst spells 43155 and 14869 are removed automatically from
-#        characters that still carry them.
+#        startup, states are disabled and an error is logged. The spells
+#        keep their Blizzard names and icons, and their client tooltips keep
+#        the original Blizzard descriptions, which do not match the module
+#        effects. The server cannot rewrite those tooltips without a client
+#        patch: the chat message sent when the state begins is the
+#        authoritative description, and the optional client addon overrides
+#        the tooltips of all four state auras with the real effects and the
+#        remedy (eat or drink). Auras of the older thirst spells 43155 and
+#        14869 are removed automatically from characters that still carry
+#        them.
 #        Default: 1
 #
 HungerThirst.ThirstStates = 1
@@ -333,8 +341,10 @@ HungerThirst.ThirstBlurIntervalMs = 10000
 #    HungerThirst.ThirstBlurDurationMs
 #        Survival only, ThirstStates=1: duration of one blur pulse in
 #        milliseconds. The intensity is 35 while hydration is in the warning
-#        or critical band (state 1) and 60 at 0 (state 2). Values below 100
-#        are clamped to 100.
+#        or critical band (state 1) and 45 at 0 (state 2). Both values are
+#        below the client's drunk threshold (50): the field is visual only
+#        and does not put the character into the drunk stance or its sliding
+#        walk animation. Values below 100 are clamped to 100.
 #        Default: 2000
 #
 HungerThirst.ThirstBlurDurationMs = 2000

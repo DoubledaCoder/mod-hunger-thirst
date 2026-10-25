@@ -4,7 +4,7 @@
 
 Hunger & Thirst is a standalone [AzerothCore](https://www.azerothcore.org/) module for World of Warcraft: Wrath of the Lich King 3.3.5a. It gives every character a satiety gauge and a hydration gauge, both running from 0 to 100. The gauges fall over time and are restored by eating and drinking. In `survival` mode, low satiety shows a visible hunger state and low hydration a visible thirst state, two debuffs that weaken the character. Neither gauge ever removes health or kills the character.
 
-No client patch is required: the states reuse four standard Blizzard spells, including their icons, as server-side auras. A graphical addon is included but **optional**: without it, chat warnings, the login summary and the `.hungerthirst` command remain available.
+No client patch is required: the states reuse four standard Blizzard spells, including their icons, as server-side auras, and the server cannot rewrite their client tooltips. A graphical addon is included but **optional**: it also replaces the four state-aura tooltips with the real effects and the remedy, while without it the original Blizzard tooltips remain and chat warnings, the login summary and the `.hungerthirst` command stay available.
 
 This repository is a module repository, not a fork of the core. It is not bundled with AzerothCore and must be installed into the `modules/` directory of an existing WotLK 3.3.5a source tree.
 
@@ -17,7 +17,7 @@ This repository is a module repository, not a fork of the core. It is not bundle
 - Three simulation modes: `off`, `advisory` and `survival`.
 - Two visible hunger states in `survival` mode, built on two otherwise unused Blizzard spells: a weakened state at or below the warning threshold (movement speed and damage dealt reduced, damage taken increased) and a stronger starving state at 0.
 - Two visible thirst states in `survival` mode, built on two otherwise unused Blizzard spells: a thirsty state at or below the warning threshold that reduces mana regeneration, magical damage done and healing done by 10% by default, and a dehydrated state at 0 that applies the same three penalties at 30% by default.
-- A periodic drinking blur for the thirst states: a 2-second client drunk visual every 10 seconds, applied through a player update field, with no aura and no gameplay effect.
+- A periodic drinking blur for the thirst states: a 2-second client blur every 10 seconds at intensity 35 (thirsty) or 45 (dehydrated), applied through a player update field. Both intensities stay below the client's drunk threshold (50), so the effect only tints the screen and never switches the character into the drunk stance or its sliding walk animation; there is no aura and no gameplay effect.
 - Thirst applies penalties only: hydration never removes health, never kills and never logs a death.
 - Food and drink credit from items, feasts, game objects and player-cast auras, with anti-double-credit windows.
 - Optional client addon using the `HT` addon prefix and the built-in 3.3.5a textures only.
@@ -172,12 +172,12 @@ In `survival` mode with `HungerStates=1`, the satiety band drives a visible debu
 | Starving | 0 | 55316 | Ravenous Hunger | `spell_holy_stoicism` | Movement speed -`HungerStarvingPenaltyPct`%, damage dealt -`HungerStarvingPenaltyPct`%, damage taken +`HungerStarvingPenaltyPct`% (30% by default) |
 
 - The state uses the same band and hysteresis logic as the gauges. The weakened state starts as soon as satiety enters the warning band and ends when the band returns to normal; a gauge leaving the warning band must rise strictly above `WarningThreshold + Hysteresis` (32 by default). The starving state starts at 0 and ends as soon as satiety rises above 0. Eating one bite from 0 to 30 by default therefore replaces starving with weakened, not with no state.
-- Entering a state applies an infinite-duration aura and sends exactly one English chat line with the real percentages. The line is sent on entry only, never per tick. Leaving a state removes its aura; switching between the two states removes the old aura before applying the new one.
+- Entering a state applies an infinite-duration aura and sends exactly one English chat line with the real percentages and the remedy. The weakened line ends with `Eat something.`, the starving line with `Eat something!`. The line is sent on entry only, never per tick. Leaving a state removes its aura; switching between the two states removes the old aura before applying the new one.
 - The three effects are speed reduction, damage-dealt reduction and damage-taken increase. Damage effects cover every spell school. The percentage is the same for all three effects of a state, but differs between the weakened and starving states.
 - The aura is a negative debuff (red border) and cannot be dispelled, cancelled by right-click or removed by immunity effects: the patched spells have no dispel type and no mechanic. Only the module removes them, following the band, when the states are disabled or when the mode leaves `survival`.
 - The state is reconciled on every active tick, which covers login, resurrection, `.reload config` and `.hungerthirst set/reset`. Death removes all auras by core behavior; the next active tick after resurrection re-applies the state if the band still calls for it.
 - Any pause (taxi, battleground, arena, duel, GM exemption) stops the tick: gauges are frozen and the state is left exactly as it was, with no chat line and no update.
-- The client displays the original Blizzard spell name and icon. Its tooltip keeps the original Blizzard description and does not show the configured percentages; the chat line, the configuration and this README are the authoritative source.
+- The client displays the original Blizzard spell name and icon. Its tooltip keeps the original Blizzard description, which describes unrelated effects, and does not show the configured percentages; the chat line, the configuration and this README are the authoritative source. The optional addon replaces that tooltip with the real effects and the remedy. Without the addon the Blizzard text stays, because no server-side change can alter a client tooltip without a client patch.
 - If either spell cannot be found at startup, the module logs an error and disables the hunger states instead of applying an unpatched spell.
 
 ### Thirst states
@@ -192,8 +192,8 @@ In `survival` mode with `ThirstStates=1`, the hydration band drives a second vis
 - Earlier module versions used 43155 ("Drink") and 14869 ("Drunken Stupor") for these states. The stock client hides both: 43155 carries `SPELL_ATTR0_DO_NOT_DISPLAY` and 14869 is passive, so no thirst icon appeared. Those legacy IDs are no longer applied; their auras are removed automatically from a character that still carries them, before the current state aura is reconciled, and whenever the thirst states are removed.
 - A single thirst state is active at a time. The state is selected from the hydration band with the same band and hysteresis logic as the gauges: thirsty starts as soon as hydration enters the warning band and ends when the band returns to normal (strictly above `WarningThreshold + Hysteresis`, 32 by default); dehydrated starts at 0 and replaces thirsty, and ends as soon as hydration rises above 0. At the default values, one standard drink restores 35 hydration, which is above 32, so a single drink can clear the state outright.
 - Thirst states exist only in `survival` with `ThirstStates=1`. `advisory` and `off` never apply a state or a blur, and `ThirstStates=0` removes both at the next tick; in those cases hydration keeps its band labels but has no gameplay effect. `advisory` keeps the hydration band warnings that `survival` replaces with the state chat line.
-- Entering a state applies an infinite-duration aura and sends exactly one English chat line with the real percentages, never once per tick:
-  - thirsty: `Your thirst weakens you: mana regeneration and spell effectiveness reduced by 10%.`
+- Entering a state applies an infinite-duration aura and sends exactly one English chat line with the real percentages and the remedy, never once per tick:
+  - thirsty: `Your thirst weakens you: mana regeneration and spell effectiveness reduced by 10%. Drink something.`
   - dehydrated: `You are dehydrated: mana regeneration and spell effectiveness reduced by 30%. Drink something!`
 - The percentages in those lines are the configured `ThirstStatePenaltyPct` and `ThirstDehydratedPenaltyPct`; the wording "spell effectiveness" covers the two spell effects below.
 - The three effects are:
@@ -204,7 +204,7 @@ In `survival` mode with `ThirstStates=1`, the hydration band drives a second vis
 - Thirst has no damage component: hydration never removes health and the module never kills. There is no damage-per-hit setting, no lethal switch, no damage ramp, no one-health floor, no death cause and no death log. The only consequences of thirst are the three percentage penalties and the blur.
 - The state is reconciled on every active tick, which covers login, resurrection, `.reload config` and `.hungerthirst set/reset`. Death removes all auras by core behavior; the next active tick after resurrection re-applies the state if the band still calls for it.
 - Any pause (taxi, battleground, arena, duel, GM exemption) stops the tick: gauges are frozen, the state aura is left exactly as it was with no chat line and no update, and any active blur is cleared (restoring the previous client value) for the duration of the pause.
-- The client displays the original Blizzard spell name and icon, localized by the client. Its tooltip keeps the original Blizzard description and does not show the configured percentages or the spirit-only mana limitation; the chat line, the configuration and this README are the authoritative source.
+- The client displays the original Blizzard spell name and icon, localized by the client. Its tooltip keeps the original Blizzard description, which describes unrelated effects, and does not show the configured percentages or the spirit-only mana limitation; the chat line, the configuration and this README are the authoritative source. The optional addon replaces that tooltip with the real effects and the remedy. Without the addon the Blizzard text stays, because no server-side change can alter a client tooltip without a client patch.
 - If either spell cannot be found at startup, the module logs an error and disables the thirst states at startup instead of applying an unpatched spell.
 
 #### Blur
@@ -212,7 +212,7 @@ In `survival` mode with `ThirstStates=1`, the hydration band drives a second vis
 While a thirst state is active, the module pulses a drinking blur on the player through the public `PLAYER_FAKE_INEBRIATION` player update field, the field the client already uses for the visual effect of intoxication. The field is written directly: no aura is applied, no buff or debuff icon appears, no combat statistic changes and the character's real intoxication state is untouched.
 
 - A pulse lasts `ThirstBlurDurationMs` (2 seconds by default) and repeats every `ThirstBlurIntervalMs` (10 seconds by default) as long as the state lasts.
-- The pulse intensity is 35 for the thirsty state and 60 for the dehydrated state. The module stores the current field value, writes the greater of the current value and the pulse intensity, then restores the stored value when the pulse ends. A pre-existing value from another source is therefore preserved.
+- The pulse intensity is 35 for the thirsty state and 45 for the dehydrated state, both below the client's drunk threshold (50), where `PLAYER_FAKE_INEBRIATION` only tints the screen: the effect is visual only and never puts the character into the drunk stance or its sliding walk animation. The module stores the current field value, writes the greater of the current value and the pulse intensity, then restores the stored value when the pulse ends. A pre-existing value from another source is therefore preserved, including a value that already places the character in the drunk state.
 - The field is not persisted in the database. It is restored when the state ends, when the tick pauses (taxi, battleground, arena, duel, GM exemption, dead), when the mode leaves `survival`, when `ThirstStates=0`, on reset and on logout.
 - No blur is produced in `off` or `advisory` mode, with `ThirstStates=0`, or while the module is disabled.
 - Caveat: whether the stock 3.3.5a client renders `PLAYER_FAKE_INEBRIATION` as a screen effect outside a real intoxication aura must be validated on a real client. If the client ignores the field, the documented fallback is a short aura using `SPELL_AURA_MOD_FAKE_INEBRIATE` (304), or `SPELL_AURA_SCREEN_EFFECT` (260), applied through an unused spell; such an aura briefly shows a debuff icon. Either way there is no client patch and no MPQ change.
@@ -253,13 +253,25 @@ cp -r modules/mod-hunger-thirst/client/Interface/AddOns/HungerThirst \
       "/path/to/World of Warcraft/Interface/AddOns/"
 ```
 
-The addon displays the satiety and hydration gauges and their band labels, and it only reads the state sent by the server. It uses the `HT` addon prefix; `HungerThirst.AddonPrefix` must match the prefix configured in the addon. Slash commands:
+The addon displays the satiety and hydration gauges and their band labels. Apart from the aura tooltip override described below, it only reads the state sent by the server. It uses the `HT` addon prefix; `HungerThirst.AddonPrefix` must match the prefix configured in the addon. Slash commands:
 
 - `/hungerthirst` or `/ht` shows or hides the gauge window.
 - `/hungerthirst reset` moves the window and the status icons back to their default positions and shows the window.
 - `/hungerthirst icons` shows or hides the status icons; the choice is saved.
 
-The window position, icon position and icon visibility are saved between sessions. The thirst states do not change the addon protocol, the gauge values or the band labels; the state spell auras are the only visible difference.
+The window position, icon position and icon visibility are saved between sessions. The thirst states do not change the addon protocol, the gauge values or the band labels. The addon adds one client-side element: it replaces the tooltips of the four state auras, as described below.
+
+### Aura tooltips
+
+The server patches the four state spells only on its side, so the stock client tooltips keep the original Blizzard names and descriptions, which describe unrelated effects. The addon corrects them: it hooks `GameTooltip:SetUnitAura` for the player and replaces the Blizzard title and description of spells 52749, 55316, 46583 and 14870 with a state name, the three effects of that state and how to remove it.
+
+- The effects and remedies are the ones documented under [Hunger states](#hunger-states) and [Thirst states](#thirst-states): movement speed, damage dealt and damage taken for hunger; mana regeneration, magical damage done and healing done for thirst.
+- The remedy states how to leave the state: for hunger, eat until satiety is strictly above `WarningThreshold + Hysteresis`; from 0, the first bite replaces starving with weakened and the second clears the state. For thirst, drink until hydration is above the same margin; with the default 35-point drink, one drink suffices.
+- The percentages shown are the module defaults (10% for the warning-band state, 30% at 0) and are labelled as such, because the addon protocol does not carry the configured values. The actual percentages are in the entry chat line.
+- The replacement titles and lines are written in French.
+- The hook only covers the player's own auras and leaves every other aura and tooltip untouched. It is a client-side display change: other players, and clients without the addon, still see the Blizzard tooltip.
+
+Without the addon the Blizzard tooltip remains and the entry chat line is the authoritative description of the state, its real percentages and its remedy. The addon can only override the text on the local client; changing the underlying tooltip data shipped with the game would require a client patch or a DBC edit, which the module does not use.
 
 ### Protocol
 
@@ -283,7 +295,7 @@ A login snapshot is sent immediately. In mode `off` it carries `mode=0` and no p
 
 Two small status icons, one for satiety and one for hydration, are shown by default even when the gauge window is hidden. They sit at the bottom right of the screen, can be moved by dragging, and their position is saved. The border color indicates the band: gray for normal, yellow for warning, orange for critical and red for empty. The tooltip shows the value out of 100, the band and the active mode. A left click on either icon shows or hides the gauge window. The icons use only built-in 3.3.5a textures (`INV_Misc_Food_15` and `INV_Drink_05`); no custom texture or client patch is needed.
 
-Without the addon, everything remains functional through chat warnings, the hunger and thirst state debuffs, the login summary and the `.hungerthirst` command.
+Without the addon, everything remains functional through chat warnings, the hunger and thirst state debuffs, the login summary and the `.hungerthirst` command; the state tooltips then keep their original Blizzard text, and the entry chat line remains authoritative.
 
 ## Compatibility
 
@@ -298,8 +310,8 @@ Without the addon, everything remains functional through chat warnings, the hung
 ## Limitations
 
 - The 3.3.5a client exposes no native hunger or thirst gauge. The visual display therefore depends on the optional addon; without it, only the state debuffs, chat messages and commands are available.
-- The state debuffs show a Blizzard spell name and icon, localized by the client. Their tooltips keep the original Blizzard descriptions and do not display the configured penalties; the real values appear in the entry chat line, the configuration and this README. On the weakened hunger spell the client may briefly show the original short duration countdown, but the server keeps the aura as long as the state lasts.
-- The drinking blur depends on the client rendering the `PLAYER_FAKE_INEBRIATION` field without an aura. This must be validated on a real client; if the field is ignored, the fallback is a short aura (`SPELL_AURA_MOD_FAKE_INEBRIATE` or `SPELL_AURA_SCREEN_EFFECT`), which briefly shows a debuff icon. No client patch or MPQ is used in either case.
+- The state debuffs show a Blizzard spell name and icon, localized by the client. Their tooltips keep the original Blizzard descriptions, which describe unrelated effects and not the configured penalties; the real values and the remedy appear in the entry chat line, the configuration and this README. The optional addon overrides those four tooltips with the effects and the remedy, using the default percentages; without it the Blizzard text stays. No native server-side tooltip change is possible without a client patch. On the weakened hunger spell the client may briefly show the original short duration countdown, but the server keeps the aura as long as the state lasts.
+- The drinking blur depends on the client rendering the `PLAYER_FAKE_INEBRIATION` field without an aura. Its intensities (35 and 45) are deliberately kept below the client's drunk threshold (50) so the blur stays a screen tint and never triggers the drunk stance or its sliding walk animation. Whether the stock client renders the field as expected must be validated on a real client; if the field is ignored, the fallback is a short aura (`SPELL_AURA_MOD_FAKE_INEBRIATE` or `SPELL_AURA_SCREEN_EFFECT`), which briefly shows a debuff icon. No client patch or MPQ is used in either case.
 - The mana-regeneration penalty applies to the spirit-based regeneration only. The flat mana-per-5-seconds regeneration is unaffected in this core; reducing it would require a core change the module deliberately avoids.
 - The module ships with `Mode = off`. Without explicit configuration it has no gameplay effect.
 - The states exist only in `survival` mode. `HungerStates=0` leaves hunger with no gameplay effect; `ThirstStates=0` leaves hydration with no gameplay effect, no state and no blur. In both cases the corresponding band warnings are then not sent in `survival` (they remain available in `advisory`).

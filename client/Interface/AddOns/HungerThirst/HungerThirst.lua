@@ -655,3 +655,93 @@ SlashCmdList["HUNGERTHIRST"] = function(message)
 end
 
 Update()
+
+--------------------------------------------------------------------------------
+-- Aura tooltips
+--
+-- The server reuses four stock Blizzard spells and patches their server-side
+-- data, so the client tooltips keep the original, unrelated descriptions.
+-- These overrides replace them with the module's effects and remedies.
+--------------------------------------------------------------------------------
+
+local AURA_TOOLTIPS = {
+    [52749] = {
+        title = "Faim — Appétit vorace",
+        lines = {
+            "Vitesse de déplacement : -10 % par défaut",
+            "Dégâts infligés : -10 % par défaut",
+            "Dégâts subis : +10 % par défaut",
+            "Pourcentages réels : voir la ligne de chat à l'entrée de l'état.",
+            "Remède : mange pour repasser au-dessus de 32 % de satiété (30 % + 2, valeurs par défaut). " ..
+                "Depuis 0 %, une bouchée remonte à 30 % et laisse l'état affamé, mais reste dans " ..
+                "l'état affaibli ; une seconde bouchée sort des deux.",
+        },
+    },
+    [55316] = {
+        title = "Faim — Faim dévorante",
+        lines = {
+            "Vitesse de déplacement : -30 % par défaut",
+            "Dégâts infligés : -30 % par défaut",
+            "Dégâts subis : +30 % par défaut",
+            "Pourcentages réels : voir la ligne de chat à l'entrée de l'état.",
+            "Remède : mange pour repasser au-dessus de 32 % de satiété (30 % + 2, valeurs par défaut). " ..
+                "Depuis 0 %, une bouchée remonte à 30 % et laisse l'état affamé, mais reste dans " ..
+                "l'état affaibli ; une seconde bouchée sort des deux.",
+        },
+    },
+    [46583] = {
+        title = "Soif — Très soif",
+        lines = {
+            "Régénération de mana (Esprit) : -10 % par défaut",
+            "Dégâts magiques infligés : -10 % par défaut",
+            "Soins prodigués : -10 % par défaut",
+            "Pourcentages réels : voir la ligne de chat à l'entrée de l'état.",
+            "Remède : bois pour repasser au-dessus de 32 % d'hydratation (30 % + 2, valeurs par défaut).",
+        },
+    },
+    [14870] = {
+        title = "Soif — Déshydraté",
+        lines = {
+            "Régénération de mana (Esprit) : -30 % par défaut",
+            "Dégâts magiques infligés : -30 % par défaut",
+            "Soins prodigués : -30 % par défaut",
+            "Pourcentages réels : voir la ligne de chat à l'entrée de l'état.",
+            "Remède : bois ; une boisson rend 35 points par défaut et sort de l'état.",
+        },
+    },
+}
+
+-- UnitAura returns the spell ID as its 11th value; this fallback covers
+-- clients that omit it and matches the English aura names.
+local AURA_TOOLTIPS_BY_NAME = {
+    ["Voracious Appetite"] = AURA_TOOLTIPS[52749],
+    ["Ravenous Hunger"] = AURA_TOOLTIPS[55316],
+    ["Cosmetic - Drink"] = AURA_TOOLTIPS[46583],
+    ["Drunken Stupor"] = AURA_TOOLTIPS[14870],
+}
+
+if GameTooltip and GameTooltip.SetUnitAura then
+    hooksecurefunc(GameTooltip, "SetUnitAura", function(self, unit, index, filter)
+        if unit ~= "player" then
+            return
+        end
+
+        local name, _, _, _, _, _, _, _, _, _, spellId = UnitAura(unit, index, filter)
+        local entry
+        if spellId then
+            entry = AURA_TOOLTIPS[spellId]
+        elseif name then
+            entry = AURA_TOOLTIPS_BY_NAME[name]
+        end
+        if not entry then
+            return
+        end
+
+        self:ClearLines()
+        self:AddLine(entry.title, 1, 0.82, 0.25)
+        for _, line in ipairs(entry.lines) do
+            self:AddLine(line, 1, 1, 1, true)
+        end
+        self:Show()
+    end)
+end
