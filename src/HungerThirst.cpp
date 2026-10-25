@@ -10,9 +10,9 @@
  * Design notes:
  *   - The cache is touched from map update threads (Tick) and from the world
  *     thread (commands). Every access is protected by a mutex; no re-entrant
- *     player API (damage, chat, script hooks) is called while that mutex is
- *     held, because a damage application can run script hooks that re-enter
- *     this module.
+ *     player API (auras, chat, script hooks) is called while that mutex is
+ *     held, because those calls can run script hooks that re-enter this
+ *     module.
  *   - Writes are conditional on `updated_at` so a stale save (for example a
  *     logout racing a periodic save) can never overwrite newer gauges.
  *   - A DB error is not treated as "new character": the state stays
@@ -37,6 +37,7 @@
 #include "SpellInfo.h"
 #include "SpellMgr.h"
 #include "StringFormat.h"
+#include "UpdateFields.h"
 #include "WorldPacket.h"
 #include "WorldSession.h"
 
@@ -69,14 +70,23 @@ namespace HungerThirst
         constexpr uint32 MinIntervalMs      = 1000;
         constexpr double MinGaugeValue      = 0.00;
         constexpr double MaxGaugeValue      = 100.00;
-        constexpr uint32 MaxRampTicks       = 1000;
         constexpr std::size_t MaxCachedAuras = 64;
+
+        // Thirst blur: pulse the public client drunk field for a short while
+        // every interval; no aura and no gameplay effect.
+        constexpr uint32 ThirstBlurIntervalDefaultMs = 10000;
+        constexpr uint32 ThirstBlurDurationDefaultMs = 2000;
+        constexpr uint32 MinBlurDurationMs           = 100;
+        constexpr int32  ThirstBlurValueThirsty      = 35;
+        constexpr int32  ThirstBlurValueDehydrated   = 60;
 
         // Blizzard spells that no content references any more, repurposed as
         // the hunger state debuffs. They are patched on the server only; no
         // client data is touched.
         constexpr uint32 SpellHungerWeakenedId = 52749; // "Voracious Appetite" / frFR "Appétit vorace"
         constexpr uint32 SpellHungerStarvingId = 55316; // "Ravenous Hunger" / frFR "Faim dévorante"
+        constexpr uint32 SpellThirstyId        = 43155; // "Drink"
+        constexpr uint32 SpellDehydratedId     = 14869; // "Drunken Stupor"
         constexpr uint32 InfiniteDurationIndex = 21;    // SpellDuration.dbc: Duration = -1
 
         // Reproduces the core ApplySpellFix pattern
@@ -131,9 +141,84 @@ namespace HungerThirst
 
             spellInfo->DurationEntry = sSpellDurationStore.LookupEntry(InfiniteDurationIndex);
             spellInfo->AttributesCu  = SPELL_ATTR0_CU_NEGATIVE; // applied as a debuff
+            spellInfo->Attributes   &= ~SPELL_ATTR0_PASSIVE;    // passive auras are not sent to the client
+
+            // Repurposed spells may carry Blizzard interrupt flags (43155
+            // interrupts on movement or damage); the state aura must stay
+            // until the module removes it.
+            spellInfo->InterruptFlags        = 0;
+            spellInfo->AuraInterruptFlags    = 0;
+            spellInfo->ChannelInterruptFlags = 0;
 
             LOG_INFO("module.hunger-thirst",
                 "Hunger state spell {} patched (-{}% speed, -{}% damage done, +{}% damage taken).",
+                spellId, pct, pct, pct);
+            return true;
+        }
+
+        // Same server-side patch as the hunger states, for the thirst states:
+        // effect 0 reduces spirit-based mana regeneration, effect 1 magical
+        // damage done and effect 2 healing done, all by the same percentage.
+        bool PatchThirstStateSpell(uint32 spellId, double penaltyPct)
+        {
+            SpellInfo const* info = sSpellMgr->GetSpellInfo(spellId);
+            if (!info)
+            {
+                LOG_ERROR("module.hunger-thirst", "Spell {} not found; thirst states disabled.", spellId);
+                return false;
+            }
+
+            SpellInfo* spellInfo = const_cast<SpellInfo*>(info);
+            int32 const pct = int32(std::lround(std::clamp(penaltyPct, 0.0, 90.0)));
+
+            // Effect 0: mana regeneration -pct% (the spirit-based part only;
+            // the flat mp5 regeneration is not affected by this aura).
+            spellInfo->Effects[0].Effect        = SPELL_EFFECT_APPLY_AURA;
+            spellInfo->Effects[0].ApplyAuraName = SPELL_AURA_MOD_POWER_REGEN_PERCENT;
+            spellInfo->Effects[0].BasePoints    = -pct;
+            spellInfo->Effects[0].MiscValue     = POWER_MANA;
+            // Effect 1: magical damage done -pct%, physical and ranged excluded.
+            spellInfo->Effects[1].Effect        = SPELL_EFFECT_APPLY_AURA;
+            spellInfo->Effects[1].ApplyAuraName = SPELL_AURA_MOD_DAMAGE_PERCENT_DONE;
+            spellInfo->Effects[1].BasePoints    = -pct;
+            spellInfo->Effects[1].MiscValue     = SPELL_SCHOOL_MASK_MAGIC;
+            // Effect 2: healing done -pct%.
+            spellInfo->Effects[2].Effect        = SPELL_EFFECT_APPLY_AURA;
+            spellInfo->Effects[2].ApplyAuraName = SPELL_AURA_MOD_HEALING_DONE_PERCENT;
+            spellInfo->Effects[2].BasePoints    = -pct;
+            spellInfo->Effects[2].MiscValue     = 0;
+
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+            {
+                SpellEffectInfo& effect = spellInfo->Effects[i];
+                effect.DieSides            = 0;
+                effect.RealPointsPerLevel  = 0.0f;
+                effect.PointsPerComboPoint = 0.0f;
+                effect.ValueMultiplier     = 1.0f;
+                effect.DamageMultiplier    = 1.0f;
+                effect.BonusMultiplier     = 0.0f;
+                effect.Amplitude           = 0;
+                effect.Mechanic            = MECHANIC_NONE; // freedom and immunities do not interact
+                effect.TargetA             = SpellImplicitTargetInfo(TARGET_UNIT_CASTER);
+                effect.TargetB             = SpellImplicitTargetInfo(0);
+                effect.TriggerSpell        = 0;
+                effect.ItemType            = 0;
+                effect.SpellClassMask      = flag96();
+            }
+
+            spellInfo->DurationEntry = sSpellDurationStore.LookupEntry(InfiniteDurationIndex);
+            spellInfo->AttributesCu  = SPELL_ATTR0_CU_NEGATIVE; // applied as a debuff
+            spellInfo->Attributes   &= ~SPELL_ATTR0_PASSIVE;    // passive auras are not sent to the client
+
+            // Repurposed spells may carry Blizzard interrupt flags (43155
+            // interrupts on movement or damage); the state aura must stay
+            // until the module removes it.
+            spellInfo->InterruptFlags        = 0;
+            spellInfo->AuraInterruptFlags    = 0;
+            spellInfo->ChannelInterruptFlags = 0;
+
+            LOG_INFO("module.hunger-thirst",
+                "Thirst state spell {} patched (-{}% mana regeneration, -{}% magic damage, -{}% healing).",
                 spellId, pct, pct, pct);
             return true;
         }
@@ -145,12 +230,13 @@ namespace HungerThirst
             bool   Loaded          = false;
             bool   Dirty           = false;
             uint64 UpdatedAtMs     = 0;
-            uint64 DamageTimerMs   = 0;
-            uint32 RampTicks       = 0;
             Band   SatietyBand     = Band::Normal;
             Band   HydrationBand   = Band::Normal;
             uint64 AddonTimerMs    = 0;
-            bool   AtOneHpWarned   = false;
+            uint64 BlurTimerMs     = 0;
+            uint32 BlurRemainingMs = 0;
+            bool   BlurActive      = false;
+            int32  BlurPreviousValue = 0;
 
             // Anti-double-credit bookkeeping.
             std::map<uint32, uint64> ItemCredits; // item entry -> expiry epoch ms
@@ -162,8 +248,6 @@ namespace HungerThirst
 
         std::mutex g_schemaMutex;
         std::atomic<bool> g_persistenceReady{ false };
-
-        thread_local DeathCause g_pendingDeathCause = DeathCause::None;
 
         uint64 NowMs()
         {
@@ -209,6 +293,21 @@ namespace HungerThirst
                 LOG_ERROR("module.hunger-thirst", "HungerThirst.{} = {} ms is below the minimum of {} ms; clamping.",
                     key, value, MinIntervalMs);
                 return MinIntervalMs;
+            }
+
+            return value;
+        }
+
+        // The blur duration has its own floor: it is not a module interval and
+        // may legitimately be shorter than MinIntervalMs.
+        uint32 ClampBlurDuration(uint32 value)
+        {
+            if (value < MinBlurDurationMs)
+            {
+                LOG_ERROR("module.hunger-thirst",
+                    "HungerThirst.ThirstBlurDurationMs = {} ms is below the minimum of {} ms; clamping.",
+                    value, MinBlurDurationMs);
+                return MinBlurDurationMs;
             }
 
             return value;
@@ -289,23 +388,6 @@ namespace HungerThirst
             return nullptr;
         }
 
-        char const* CauseName(DeathCause cause)
-        {
-            switch (cause)
-            {
-                case DeathCause::Starvation:
-                    return "starvation";
-                case DeathCause::Dehydration:
-                    return "dehydration";
-                case DeathCause::Both:
-                    return "starvation and dehydration";
-                case DeathCause::None:
-                    break;
-            }
-
-            return "none";
-        }
-
         void SendChatLine(Player* player, std::string_view message)
         {
             if (!player || message.empty() || !player->GetSession())
@@ -339,6 +421,155 @@ namespace HungerThirst
             }
 
             return HungerState::None;
+        }
+
+        enum class ThirstState : uint8
+        {
+            None       = 0,
+            Thirsty    = 1,
+            Dehydrated = 2
+        };
+
+        // Warning and critical share the first state; dehydration only starts
+        // with an empty gauge. Hysteresis is handled by the band resolution.
+        ThirstState ThirstStateFromBand(Band band)
+        {
+            switch (band)
+            {
+                case Band::Warning:
+                case Band::Critical:
+                    return ThirstState::Thirsty;
+                case Band::Empty:
+                    return ThirstState::Dehydrated;
+                case Band::Normal:
+                    break;
+            }
+
+            return ThirstState::None;
+        }
+
+        // Restores the client drunk field and forgets any pending pulse. The
+        // field is written outside the state mutex: SetInt32Value updates the
+        // player and must never run under g_stateMutex.
+        void ClearThirstBlur(Player* player)
+        {
+            if (!player)
+                return;
+
+            uint32 const guid = player->GetGUID().GetCounter();
+            bool restore = false;
+            int32 restoreValue = 0;
+
+            {
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                auto const it = g_states.find(guid);
+                if (it == g_states.end())
+                    return;
+
+                State& state = it->second;
+                if (state.BlurActive)
+                {
+                    restore = true;
+                    restoreValue = state.BlurPreviousValue;
+                }
+
+                state.BlurActive = false;
+                state.BlurRemainingMs = 0;
+                state.BlurTimerMs = 0;
+            }
+
+            if (restore)
+                player->SetInt32Value(PLAYER_FAKE_INEBRIATION, restoreValue);
+        }
+
+        // Pulses PLAYER_FAKE_INEBRIATION for ThirstBlurDurationMs every
+        // ThirstBlurIntervalMs while a thirst state is active. The field value
+        // found on the first pulse is saved and restored when the pulse ends
+        // or the state disappears, so other drunk sources are preserved.
+        void UpdateThirstBlur(Player* player, ThirstState desired, Config const& cfg, uint32 diff)
+        {
+            if (!player)
+                return;
+
+            uint32 const guid = player->GetGUID().GetCounter();
+            uint32 const interval = std::max<uint32>(1, cfg.ThirstBlurIntervalMs);
+            uint32 const duration = std::min(interval, std::max<uint32>(1, cfg.ThirstBlurDurationMs));
+            int32 const intensity = desired == ThirstState::Dehydrated
+                ? ThirstBlurValueDehydrated
+                : ThirstBlurValueThirsty;
+
+            bool restore = false;
+            bool startPulse = false;
+            int32 restoreValue = 0;
+
+            {
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                auto const it = g_states.find(guid);
+                if (it == g_states.end() || !it->second.Loaded)
+                    return;
+
+                State& state = it->second;
+
+                if (desired == ThirstState::None)
+                {
+                    if (state.BlurActive)
+                    {
+                        restore = true;
+                        restoreValue = state.BlurPreviousValue;
+                    }
+
+                    state.BlurActive = false;
+                    state.BlurRemainingMs = 0;
+                    state.BlurTimerMs = 0;
+                }
+                else
+                {
+                    // A zero timer with no pulse pending marks a fresh entry
+                    // (None resets the timer), so the first pulse is shown at
+                    // once; later pulses follow the interval.
+                    if (!state.BlurActive && state.BlurTimerMs == 0 && state.BlurRemainingMs == 0)
+                        state.BlurTimerMs = interval;
+                    else
+                        state.BlurTimerMs += diff;
+
+                    if (state.BlurActive)
+                    {
+                        if (state.BlurRemainingMs <= diff)
+                        {
+                            restore = true;
+                            restoreValue = state.BlurPreviousValue;
+                            state.BlurActive = false;
+                            state.BlurRemainingMs = 0;
+                        }
+                        else
+                            state.BlurRemainingMs -= diff;
+                    }
+                    else if (state.BlurTimerMs >= interval)
+                    {
+                        startPulse = true;
+                        state.BlurTimerMs = 0;
+                    }
+                }
+            }
+
+            if (restore)
+                player->SetInt32Value(PLAYER_FAKE_INEBRIATION, restoreValue);
+
+            if (!startPulse)
+                return;
+
+            int32 const previous = player->GetInt32Value(PLAYER_FAKE_INEBRIATION);
+            player->SetInt32Value(PLAYER_FAKE_INEBRIATION, std::max(previous, intensity));
+
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto const it = g_states.find(guid);
+            if (it == g_states.end())
+                return;
+
+            State& state = it->second;
+            state.BlurPreviousValue = previous;
+            state.BlurActive = true;
+            state.BlurRemainingMs = duration;
         }
 
         void RemoveHungerStates(Player* player)
@@ -392,6 +623,69 @@ namespace HungerThirst
             }
         }
 
+        void RemoveThirstStates(Player* player)
+        {
+            if (!player)
+                return;
+
+            if (player->HasAura(SpellThirstyId))
+                player->RemoveAurasDueToSpell(SpellThirstyId);
+            if (player->HasAura(SpellDehydratedId))
+                player->RemoveAurasDueToSpell(SpellDehydratedId);
+
+            ClearThirstBlur(player);
+        }
+
+        // Same reconciliation as the hunger states, with a single entry line
+        // carrying the configured penalty. Called from Tick only.
+        void ApplyThirstState(Player* player, ThirstState desired, Config const& cfg)
+        {
+            bool const thirsty = player->HasAura(SpellThirstyId);
+            bool const dehydrated = player->HasAura(SpellDehydratedId);
+
+            switch (desired)
+            {
+                case ThirstState::None:
+                    if (thirsty)
+                        player->RemoveAurasDueToSpell(SpellThirstyId);
+                    if (dehydrated)
+                        player->RemoveAurasDueToSpell(SpellDehydratedId);
+                    break;
+                case ThirstState::Thirsty:
+                    if (dehydrated)
+                        player->RemoveAurasDueToSpell(SpellDehydratedId);
+                    if (!thirsty)
+                    {
+                        Aura* const applied = player->AddAura(SpellThirstyId, player);
+                        if (!applied)
+                            LOG_ERROR("module.hunger-thirst",
+                                "Failed to apply thirst state aura {} to {}.", SpellThirstyId, player->GetName());
+                        else
+                            SendChatLine(player, Acore::StringFormat(
+                                "Your thirst weakens you: mana regeneration and spell effectiveness "
+                                "reduced by {:.0f}%.",
+                                cfg.ThirstStatePenaltyPct));
+                    }
+                    break;
+                case ThirstState::Dehydrated:
+                    if (thirsty)
+                        player->RemoveAurasDueToSpell(SpellThirstyId);
+                    if (!dehydrated)
+                    {
+                        Aura* const applied = player->AddAura(SpellDehydratedId, player);
+                        if (!applied)
+                            LOG_ERROR("module.hunger-thirst",
+                                "Failed to apply thirst state aura {} to {}.", SpellDehydratedId, player->GetName());
+                        else
+                            SendChatLine(player, Acore::StringFormat(
+                                "You are dehydrated: mana regeneration and spell effectiveness reduced "
+                                "by {:.0f}%. Drink something!",
+                                cfg.ThirstDehydratedPenaltyPct));
+                    }
+                    break;
+            }
+        }
+
         template <typename Key>
         void PruneExpiredMap(std::map<Key, uint64>& credits, uint64 now)
         {
@@ -434,14 +728,6 @@ namespace HungerThirst
             LOG_ERROR("module.hunger-thirst", "Unknown HungerThirst.Mode '{}'; falling back to off.", mode);
             cfg.CurrentMode = Mode::Off;
         }
-
-        cfg.Lethal = sConfigMgr->GetOption<bool>("HungerThirst.Lethal", false);
-        cfg.LethalRampPct = ClampRange(
-            sConfigMgr->GetOption<float>("HungerThirst.LethalRampPct", 0.50),
-            0.00, 100.00, "LethalRampPct");
-        cfg.LethalMaxDamagePct = ClampRange(
-            sConfigMgr->GetOption<float>("HungerThirst.LethalMaxDamagePct", 5.00),
-            0.00, 100.00, "LethalMaxDamagePct");
 
         cfg.SatietyDecayPerMinute = ClampRange(
             sConfigMgr->GetOption<float>("HungerThirst.SatietyDecayPerMinute", 0.50),
@@ -491,21 +777,26 @@ namespace HungerThirst
             sConfigMgr->GetOption<float>("HungerThirst.HungerStarvingPenaltyPct", 30.00),
             0.00, 90.00, "HungerStarvingPenaltyPct");
 
-        cfg.StarvingDamagePct = ClampRange(
-            sConfigMgr->GetOption<float>("HungerThirst.StarvingDamagePct", 0.50),
-            0.00, 100.00, "StarvingDamagePct");
-        cfg.StarvingIntervalMs = ClampInterval(
-            sConfigMgr->GetOption<uint32>("HungerThirst.StarvingIntervalMs", 10000), "StarvingIntervalMs");
-
-        cfg.DehydratedDamagePct = ClampRange(
-            sConfigMgr->GetOption<float>("HungerThirst.DehydratedDamagePct", 1.00),
-            0.00, 100.00, "DehydratedDamagePct");
-        cfg.DehydratedIntervalMs = ClampInterval(
-            sConfigMgr->GetOption<uint32>("HungerThirst.DehydratedIntervalMs", 5000), "DehydratedIntervalMs");
-
-        cfg.DoubleEmptyMultiplier = ClampRange(
-            sConfigMgr->GetOption<float>("HungerThirst.DoubleEmptyMultiplier", 1.50),
-            1.00, 10.00, "DoubleEmptyMultiplier");
+        cfg.ThirstStates = sConfigMgr->GetOption<bool>("HungerThirst.ThirstStates", true);
+        cfg.ThirstStatePenaltyPct = ClampRange(
+            sConfigMgr->GetOption<float>("HungerThirst.ThirstStatePenaltyPct", 10.00),
+            0.00, 90.00, "ThirstStatePenaltyPct");
+        cfg.ThirstDehydratedPenaltyPct = ClampRange(
+            sConfigMgr->GetOption<float>("HungerThirst.ThirstDehydratedPenaltyPct", 30.00),
+            0.00, 90.00, "ThirstDehydratedPenaltyPct");
+        cfg.ThirstBlurIntervalMs = ClampInterval(
+            sConfigMgr->GetOption<uint32>("HungerThirst.ThirstBlurIntervalMs", ThirstBlurIntervalDefaultMs),
+            "ThirstBlurIntervalMs");
+        cfg.ThirstBlurDurationMs = ClampBlurDuration(
+            sConfigMgr->GetOption<uint32>("HungerThirst.ThirstBlurDurationMs", ThirstBlurDurationDefaultMs));
+        if (cfg.ThirstBlurDurationMs > cfg.ThirstBlurIntervalMs)
+        {
+            LOG_ERROR("module.hunger-thirst",
+                "HungerThirst.ThirstBlurDurationMs ({}) cannot exceed HungerThirst.ThirstBlurIntervalMs ({}); "
+                "using {} ms.",
+                cfg.ThirstBlurDurationMs, cfg.ThirstBlurIntervalMs, cfg.ThirstBlurIntervalMs);
+            cfg.ThirstBlurDurationMs = cfg.ThirstBlurIntervalMs;
+        }
 
         cfg.FoodSatietyGain = ClampRange(
             sConfigMgr->GetOption<float>("HungerThirst.FoodSatietyGain", 30.00),
@@ -544,8 +835,8 @@ namespace HungerThirst
             cfg.AddonPrefix = "HT";
         }
 
-        LOG_INFO("module.hunger-thirst", "Configuration {}: enable {}, mode {}, lethal {}, addon {}.",
-            reload ? "reloaded" : "loaded", cfg.Enable, ModeName(cfg.CurrentMode), cfg.Lethal, cfg.AddonEnable);
+        LOG_INFO("module.hunger-thirst", "Configuration {}: enable {}, mode {}, addon {}.",
+            reload ? "reloaded" : "loaded", cfg.Enable, ModeName(cfg.CurrentMode), cfg.AddonEnable);
     }
 
     void EnsureSchema()
@@ -753,6 +1044,9 @@ namespace HungerThirst
         if (!player)
             return;
 
+        // The client field is not persisted: restore it before the state row
+        // is dropped so a reconnect starts clean.
+        ClearThirstBlur(player);
         RemoveStateByGuid(player->GetGUID().GetCounter());
     }
 
@@ -768,34 +1062,55 @@ namespace HungerThirst
         if (!player)
             return;
 
-        // In advisory mode, or with the states disabled, the module keeps
+        // Outside survival, or with the states disabled, the module keeps
         // decaying and warning as before; only the state auras are removed.
         if (!cfg.Enable || cfg.CurrentMode != Mode::Survival || !cfg.HungerStates)
             RemoveHungerStates(player);
+
+        if (!cfg.Enable || cfg.CurrentMode != Mode::Survival || !cfg.ThirstStates)
+            RemoveThirstStates(player);
 
         if (!cfg.Enable || cfg.CurrentMode == Mode::Off)
             return;
 
         if (!player->IsInWorld() || !player->IsAlive())
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         bool const inBattleground = player->GetBattlegroundId() != 0;
         bool const inArena = player->InArena();
 
         if (cfg.ExemptGMs && player->GetSession() && player->GetSession()->IsGMAccount())
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         if (cfg.PauseOnTaxi && player->IsInFlight())
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         if (cfg.PauseInBattleground && inBattleground)
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         if (cfg.PauseInArena && inArena)
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         if (player->duel)
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         uint32 const effectiveDiff = std::min<uint32>(diff, MaxTickDiffMs);
         if (!effectiveDiff)
@@ -813,20 +1128,12 @@ namespace HungerThirst
             multiplier *= cfg.InstanceMultiplier;
 
         uint32 const guid = player->GetGUID().GetCounter();
-        uint32 const playerHealth = player->GetHealth();
-        uint32 const playerMaxHealth = player->GetMaxHealth();
 
         char const* satietyMessage = nullptr;
         char const* hydrationMessage = nullptr;
         HungerState desiredHungerState = HungerState::None;
+        ThirstState desiredThirstState = ThirstState::None;
         bool sendAddon = false;
-        bool atOneHpWarning = false;
-        bool hydrationCritical = false;
-        bool satietyEmpty = false;
-        bool hydrationEmpty = false;
-        bool bothEmpty = false;
-        uint32 damageToApply = 0;
-        bool const lethal = cfg.Lethal;
 
         {
             std::lock_guard<std::mutex> lock(g_stateMutex);
@@ -856,89 +1163,14 @@ namespace HungerThirst
             state.HydrationBand = ResolveBand(state.Hydration, state.HydrationBand, cfg);
 
             desiredHungerState = HungerStateFromBand(state.SatietyBand);
+            desiredThirstState = ThirstStateFromBand(state.HydrationBand);
 
-            // In survival the state messages replace the satiety band warnings
-            // (no contradictory duplicate); advisory keeps them unchanged.
+            // In survival the state messages replace the band warnings (no
+            // contradictory duplicate); advisory keeps them unchanged.
             if (state.SatietyBand > oldSatietyBand && cfg.CurrentMode == Mode::Advisory)
                 satietyMessage = BandMessage(false, state.SatietyBand);
-            if (state.HydrationBand > oldHydrationBand)
+            if (state.HydrationBand > oldHydrationBand && cfg.CurrentMode == Mode::Advisory)
                 hydrationMessage = BandMessage(true, state.HydrationBand);
-
-            hydrationCritical = state.Hydration <= double(cfg.CriticalThreshold);
-            satietyEmpty = state.Satiety <= MinGaugeValue;
-            hydrationEmpty = state.Hydration <= MinGaugeValue;
-            bothEmpty = satietyEmpty && hydrationEmpty;
-
-            // Hunger no longer deals damage in phase 1: only dehydration does,
-            // with exactly its previous values. Advisory must never reach this
-            // block (the entry guard only returns in off mode).
-            if (cfg.CurrentMode == Mode::Survival && hydrationCritical
-                && !inBattleground && !inArena)
-            {
-                // The warning flag is only re-armed when the critical
-                // situation ends (else branch) or a food/drink credit lands,
-                // so health regeneration does not repeat the message.
-
-                // The lethal ramp only advances while hydration is actually
-                // empty; a critical-but-nonzero gauge does not ramp.
-                if (!hydrationEmpty)
-                    state.RampTicks = 0;
-
-                uint32 const interval = hydrationEmpty ? cfg.DehydratedIntervalMs : cfg.StarvingIntervalMs;
-
-                state.DamageTimerMs += effectiveDiff;
-                if (state.DamageTimerMs >= interval)
-                {
-                    // One damage event per tick at most; the remainder is kept
-                    // so the cadence stays honest across short updates.
-                    state.DamageTimerMs -= interval;
-
-                    double pct = hydrationEmpty ? cfg.DehydratedDamagePct : cfg.StarvingDamagePct;
-                    if (bothEmpty)
-                        pct *= cfg.DoubleEmptyMultiplier;
-
-                    if (lethal && hydrationEmpty)
-                    {
-                        pct = (cfg.DehydratedDamagePct + cfg.LethalRampPct * double(state.RampTicks)) *
-                            (bothEmpty ? cfg.DoubleEmptyMultiplier : 1.00);
-                        pct = std::min(pct, cfg.LethalMaxDamagePct);
-                        state.RampTicks = std::min<uint32>(state.RampTicks + 1, MaxRampTicks);
-                    }
-
-                    uint32 const maxHealth = playerMaxHealth;
-                    uint32 damage = maxHealth
-                        ? uint32(std::ceil(double(maxHealth) * std::max(0.00, pct) / 100.00))
-                        : 1;
-                    damage = std::max<uint32>(1, damage);
-
-                    if (!lethal)
-                    {
-                        uint32 const health = playerHealth;
-                        if (health <= 1)
-                        {
-                            damage = 0;
-                            if (!state.AtOneHpWarned)
-                                atOneHpWarning = true;
-                            state.AtOneHpWarned = true;
-                        }
-                        else if (damage >= health - 1)
-                        {
-                            damage = health - 1;
-                            if (!state.AtOneHpWarned)
-                                atOneHpWarning = true;
-                            state.AtOneHpWarned = true;
-                        }
-                    }
-
-                    damageToApply = damage;
-                }
-            }
-            else
-            {
-                state.DamageTimerMs = 0;
-                state.RampTicks = 0;
-                state.AtOneHpWarned = false;
-            }
 
             if (cfg.AddonEnable && cfg.AddonUpdateIntervalMs > 0)
             {
@@ -964,44 +1196,12 @@ namespace HungerThirst
         if (cfg.CurrentMode == Mode::Survival && cfg.HungerStates)
             ApplyHungerState(player, desiredHungerState, cfg);
 
-        if (atOneHpWarning)
-            SendChatLine(player,
-                "You are at 1 health because of dehydration. "
-                "Drink something immediately!");
-
-        if (damageToApply > 0)
+        // Thirst no longer deals damage in phase 2: only the state auras and
+        // the periodic blur remain.
+        if (cfg.CurrentMode == Mode::Survival && cfg.ThirstStates)
         {
-            DeathCause const cause = bothEmpty ? DeathCause::Both : DeathCause::Dehydration;
-
-            // Set before applying: a lethal hit runs the unit death hook
-            // synchronously from inside EnvironmentalDamage, and that hook
-            // must be able to consume the cause.
-            if (lethal)
-            {
-                player->SetPvPDeath(false);
-                SetPendingDeathCause(cause);
-            }
-
-            uint32 const dealt = player->EnvironmentalDamage(DAMAGE_EXHAUSTED, damageToApply);
-
-            if (!player->IsAlive())
-            {
-                // The environmental death is not a PvP death. Set it again in
-                // case the damage handler created the corpse before returning.
-                player->SetPvPDeath(false);
-            }
-            else if (lethal)
-            {
-                // The hit did not kill after all (immunity, absorb, ...).
-                SetPendingDeathCause(DeathCause::None);
-            }
-
-            if (cfg.DebugLog)
-            {
-                LOG_DEBUG("module.hunger-thirst",
-                    "Exhaustion damage {} requested {} for {} (cause {}, lethal {}).",
-                    dealt, damageToApply, player->GetName(), CauseName(cause), lethal);
-            }
+            ApplyThirstState(player, desiredThirstState, cfg);
+            UpdateThirstBlur(player, desiredThirstState, cfg, effectiveDiff);
         }
 
         if (sendAddon)
@@ -1089,9 +1289,6 @@ namespace HungerThirst
             state.HydrationBand = ResolveBand(state.Hydration, state.HydrationBand, cfg);
             state.Dirty = true;
 
-            if (state.Satiety > MinGaugeValue || state.Hydration > MinGaugeValue)
-                state.AtOneHpWarned = false;
-
             creditedSatiety = state.Satiety;
             creditedHydration = state.Hydration;
         }
@@ -1128,7 +1325,6 @@ namespace HungerThirst
         if (it == g_states.end())
         {
             out.CurrentMode = cfg.CurrentMode;
-            out.Lethal = cfg.Lethal;
             out.PersistenceReady = IsPersistenceReady();
             return false;
         }
@@ -1137,7 +1333,6 @@ namespace HungerThirst
         out.Satiety = state.Satiety;
         out.Hydration = state.Hydration;
         out.CurrentMode = cfg.CurrentMode;
-        out.Lethal = cfg.Lethal;
         out.Loaded = state.Loaded;
         out.PersistenceReady = IsPersistenceReady();
         out.SatietyBand = state.SatietyBand;
@@ -1167,9 +1362,6 @@ namespace HungerThirst
             state.Hydration = newHydration;
             state.Loaded = true;
             state.Dirty = true;
-            state.DamageTimerMs = 0;
-            state.RampTicks = 0;
-            state.AtOneHpWarned = false;
             state.SatietyBand = RawBand(newSatiety, cfg);
             state.HydrationBand = RawBand(newHydration, cfg);
             satietyBand = state.SatietyBand;
@@ -1178,11 +1370,11 @@ namespace HungerThirst
 
         // A GM jump can land directly inside a warning band without Tick
         // observing the crossing, so emit the corresponding warning once.
-        // Satiety band warnings are advisory-only in phase 1: in survival the
-        // state message of the next Tick informs the player.
-        if (cfg.CurrentMode != Mode::Off)
+        // Band warnings are advisory-only: in survival the state message of
+        // the next Tick informs the player.
+        if (cfg.CurrentMode == Mode::Advisory)
         {
-            if (cfg.CurrentMode == Mode::Advisory && satietyBand >= Band::Warning)
+            if (satietyBand >= Band::Warning)
             {
                 if (char const* message = BandMessage(false, satietyBand))
                     SendChatLine(player, message);
@@ -1194,6 +1386,9 @@ namespace HungerThirst
                     SendChatLine(player, message);
             }
         }
+
+        // Drop any running pulse: the next Tick restarts from the new state.
+        ClearThirstBlur(player);
     }
 
     void ResetState(Player* player)
@@ -1207,18 +1402,21 @@ namespace HungerThirst
 
         uint32 const guid = player->GetGUID().GetCounter();
 
-        std::lock_guard<std::mutex> lock(g_stateMutex);
-        State& state = g_states[guid];
-        state.Satiety = ClampGauge(cfg.StartingSatiety);
-        state.Hydration = ClampGauge(cfg.StartingHydration);
-        state.Loaded = true;
-        state.Dirty = true;
-        state.DamageTimerMs = 0;
-        state.RampTicks = 0;
-        state.AddonTimerMs = 0;
-        state.AtOneHpWarned = false;
-        state.SatietyBand = RawBand(state.Satiety, cfg);
-        state.HydrationBand = RawBand(state.Hydration, cfg);
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            State& state = g_states[guid];
+            state.Satiety = ClampGauge(cfg.StartingSatiety);
+            state.Hydration = ClampGauge(cfg.StartingHydration);
+            state.Loaded = true;
+            state.Dirty = true;
+            state.AddonTimerMs = 0;
+            state.SatietyBand = RawBand(state.Satiety, cfg);
+            state.HydrationBand = RawBand(state.Hydration, cfg);
+        }
+
+        // Reset restores the gauges only; any running blur is rolled back so
+        // the next Tick starts from the new state.
+        ClearThirstBlur(player);
     }
 
     void SendAddonState(Player* player)
@@ -1249,14 +1447,15 @@ namespace HungerThirst
 
         // An unloaded state (persistence down) is still advertised so the
         // client leaves "Loading..." and shows the placeholder gauges;
-        // loaded and persistence both report 0 in that case.
+        // loaded and persistence both report 0 in that case. The lethal field
+        // is kept for addon compatibility but is always 0 now.
         std::string const payload = Acore::StringFormat(
             "{}\t{:.1f}\t{:.1f}\t{}\t{}\t{}\t{}\t{}\t{}",
             cfg.AddonPrefix,
             snapshot.Satiety,
             snapshot.Hydration,
             uint32(snapshot.CurrentMode),
-            snapshot.Lethal ? 1 : 0,
+            0,
             snapshot.Loaded ? 1 : 0,
             (snapshot.Loaded && snapshot.PersistenceReady) ? 1 : 0,
             uint32(snapshot.SatietyBand),
@@ -1298,17 +1497,20 @@ namespace HungerThirst
             snapshot.Satiety, BandName(snapshot.SatietyBand, false),
             snapshot.Hydration, BandName(snapshot.HydrationBand, true));
 
-        // In survival the state message of the next Tick informs the player.
-        if (cfg.CurrentMode == Mode::Advisory && snapshot.SatietyBand >= Band::Critical)
+        // In survival the state messages of the next Tick inform the player.
+        if (cfg.CurrentMode == Mode::Advisory)
         {
-            if (char const* message = BandMessage(false, snapshot.SatietyBand))
-                SendChatLine(player, message);
-        }
+            if (snapshot.SatietyBand >= Band::Critical)
+            {
+                if (char const* message = BandMessage(false, snapshot.SatietyBand))
+                    SendChatLine(player, message);
+            }
 
-        if (snapshot.HydrationBand >= Band::Critical)
-        {
-            if (char const* message = BandMessage(true, snapshot.HydrationBand))
-                SendChatLine(player, message);
+            if (snapshot.HydrationBand >= Band::Critical)
+            {
+                if (char const* message = BandMessage(true, snapshot.HydrationBand))
+                    SendChatLine(player, message);
+            }
         }
 
         if (!snapshot.PersistenceReady)
@@ -1352,9 +1554,8 @@ namespace HungerThirst
         }
 
         handler->PSendSysMessage(
-            "Hunger & Thirst: mode {}, lethal {}, state {}, persistence {}.",
+            "Hunger & Thirst: mode {}, state {}, persistence {}.",
             ModeName(snapshot.CurrentMode),
-            snapshot.Lethal ? "yes" : "no",
             snapshot.Loaded ? "loaded" : "not loaded",
             snapshot.PersistenceReady ? "ready" : "unavailable");
 
@@ -1366,39 +1567,9 @@ namespace HungerThirst
         if (cfg.CurrentMode == Mode::Off)
             handler->SendSysMessage("Mode off: gauges are not simulated.");
         else if (cfg.CurrentMode == Mode::Advisory)
-            handler->SendSysMessage("Advisory: warnings only, no damage.");
-        else if (!snapshot.Lethal)
-            handler->SendSysMessage("Survival: non-lethal damage (floored at 1 health).");
+            handler->SendSysMessage("Advisory: warnings only, no states, no damage.");
         else
-            handler->SendSysMessage("Survival: lethal damage.");
-    }
-
-    void SetPendingDeathCause(DeathCause cause)
-    {
-        g_pendingDeathCause = cause;
-    }
-
-    DeathCause ConsumePendingDeathCause()
-    {
-        DeathCause const cause = g_pendingDeathCause;
-        g_pendingDeathCause = DeathCause::None;
-        return cause;
-    }
-
-    void LogDeath(Player* player, DeathCause cause, Snapshot const& snapshot)
-    {
-        if (!player)
-            return;
-
-        LOG_INFO("module.hunger-thirst",
-            "{} ({}) died from {} at level {} in map {} (zone {}): "
-            "satiety {:.1f} ({}), hydration {:.1f} ({}), lethal {}, persistence {}.",
-            player->GetName(), player->GetGUID().ToString(), CauseName(cause),
-            uint32(player->GetLevel()), player->GetMapId(), player->GetZoneId(),
-            snapshot.Satiety, BandName(snapshot.SatietyBand, false),
-            snapshot.Hydration, BandName(snapshot.HydrationBand, true),
-            snapshot.Lethal ? "on" : "off",
-            snapshot.PersistenceReady ? "ready" : "unavailable");
+            handler->SendSysMessage("Survival: hunger and thirst states, no exhaustion damage.");
     }
 
     char const* ModeName(Mode mode)
@@ -1466,6 +1637,11 @@ public:
             || !HungerThirst::PatchHungerStateSpell(HungerThirst::SpellHungerStarvingId,
                 cfg.HungerStarvingPenaltyPct))
             cfg.HungerStates = false; // fail safe: no states rather than wrong states
+
+        if (!HungerThirst::PatchThirstStateSpell(HungerThirst::SpellThirstyId, cfg.ThirstStatePenaltyPct)
+            || !HungerThirst::PatchThirstStateSpell(HungerThirst::SpellDehydratedId,
+                cfg.ThirstDehydratedPenaltyPct))
+            cfg.ThirstStates = false; // fail safe: no states rather than wrong states
     }
 };
 

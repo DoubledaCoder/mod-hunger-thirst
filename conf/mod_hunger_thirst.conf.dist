@@ -5,7 +5,8 @@
 #
 # Tracks satiety and hydration per character, warns the player as the gauges
 # fall and, in survival mode, applies hunger states from the satiety gauge and
-# exhaustion damage from the hydration gauge.
+# thirst states from the hydration gauge. The module never deals damage and
+# never kills a character.
 #
 # All player-facing messages (chat warnings, login summary, status command)
 # are in English.
@@ -19,12 +20,10 @@
 #     the module as disabled.
 #   - HungerThirst.Mode selects the simulation. "off" keeps the module loaded
 #     and the state persisted/queryable, but does not decay the gauges, warn,
-#     damage, or push periodic addon updates (a login snapshot with mode=0 is
-#     still sent when AddonEnable=1). "advisory" decays and warns but never
-#     damages and never applies hunger states. "survival" adds hunger states
-#     and exhaustion damage from the hydration critical band, stronger when
-#     hydration reaches 0; HungerThirst.Lethal decides whether that damage
-#     can kill.
+#     apply states, blur, or push periodic addon updates (a login snapshot
+#     with mode=0 is still sent when AddonEnable=1). "advisory" decays and
+#     warns but never applies states and never blurs. "survival" adds hunger
+#     states and thirst states, the penalties they carry and the thirst blur.
 #
 # Effects in survival mode:
 #   - Hunger states (satiety gauge, see HungerThirst.HungerStates): hunger
@@ -35,31 +34,45 @@
 #     damage dealt, and increases damage taken, by its percentage. The state
 #     is removed when satiety returns to the normal band (Hysteresis
 #     applies), when HungerStates=0, or outside survival mode.
-#   - Exhaustion damage (hydration gauge only):
-#     - hydration in the critical band (0 < hydration <= CriticalThreshold):
-#       StarvingDamagePct per StarvingIntervalMs;
-#     - hydration at 0: DehydratedDamagePct per DehydratedIntervalMs;
-#     - hydration at 0 while satiety is also at 0: that base percentage is
-#       multiplied once by DoubleEmptyMultiplier (the two percentages are
-#       never added together);
-#     - with Lethal=1 the hit at 0 ramps and may kill; with Lethal=0 every
-#       hit keeps at least 1 health.
-#   - Thirst states are planned for phase 2; hydration keeps this damage-only
-#     behaviour until then.
+#   - Thirst states (hydration gauge, see HungerThirst.ThirstStates): thirst
+#     deals no damage. Hydration at or below WarningThreshold (warning or
+#     critical band, above 0) applies spell 43155 with the penalties of
+#     ThirstStatePenaltyPct; hydration at 0 applies spell 14869 with
+#     ThirstDehydratedPenaltyPct instead. Each state reduces mana
+#     regeneration, magical damage done and healing done by its percentage;
+#     physical, ranged and pet damage are unaffected, and so is damage
+#     taken. The state is removed when hydration returns to the normal band
+#     (Hysteresis included), when ThirstStates=0, or outside survival mode.
+#   - Mana regeneration: the canonical
+#     SPELL_AURA_MOD_POWER_REGEN_PERCENT aura is used, which in this core
+#     only scales spirit-based regeneration. Flat mp5 regeneration is not
+#     reduced; no core patch is involved.
+#   - Thirst blur (see ThirstBlurIntervalMs/ThirstBlurDurationMs): while a
+#     thirst state is active, a client-side blur pulses for
+#     ThirstBlurDurationMs every ThirstBlurIntervalMs (2 s every 10 s by
+#     default) with intensity 35 for state 1 and 60 for state 2. It uses the
+#     fake inebriation player field (PLAYER_FAKE_INEBRIATION): no aura, no
+#     icon and no gameplay effect.
+#     No pulse is sent while a pause applies (see below) or once the state
+#     ends; a pulse in progress is cleared.
+#   - No exhaustion damage: thirst never removes health, and the module never
+#     causes a death (satiety and hydration alike).
 #
 # All changes can be applied with ".reload config"; they take effect at the
-# next tick. Two exceptions: HungerStatePenaltyPct and
-# HungerStarvingPenaltyPct are baked into the hunger-state spells at startup,
-# so changing them requires a server restart; and switching Enable from 0 to
-# 1 does not load state for players already online (it was dropped while
+# next tick. Two exceptions: HungerStatePenaltyPct,
+# HungerStarvingPenaltyPct, ThirstStatePenaltyPct and
+# ThirstDehydratedPenaltyPct are baked into the state spells at startup, so
+# changing them requires a server restart; and switching Enable from 0 to 1
+# does not load state for players already online (it was dropped while
 # disabled) - they must reconnect or use ".hungerthirst set"; new logins are
-# unaffected.
+# unaffected. ThirstStates, ThirstBlurIntervalMs and ThirstBlurDurationMs
+# are read live and do not need a restart.
 #
 # Some pauses are always active and have no configuration key: dead players,
 # characters whose state is still loading (or failed to load), and players
-# currently in a duel are never decayed, warned or damaged. Exhaustion damage
-# is also always suppressed in battlegrounds and arenas, even when
-# PauseInBattleground/PauseInArena are 0.
+# currently in a duel are never decayed or warned. Whenever a pause applies
+# (including the configured taxi, battleground, arena and GM exemptions) the
+# thirst blur is cleared, but state auras already applied stay in place.
 #
 # Persistence uses acore_characters.hunger_thirst_state, created
 # automatically at startup:
@@ -69,18 +82,20 @@
 #   updated_at BIGINT UNSIGNED NOT NULL DEFAULT 0 (epoch milliseconds)
 # Saves are conditional on updated_at, so an older save never overwrites a
 # newer one. If the table cannot be created or verified, the simulation is
-# suspended for the affected players: no tick (decay, warnings, damage), no
-# save, no consumable credit and no periodic addon update. Login is never
-# blocked; with an active mode and ShowLoginSummary=1 the player receives a
-# "Persistence unavailable" chat notice, and when AddonEnable=1 the addon
-# displays the same status. The state stays unloaded for the whole
+# suspended for the affected players: no tick (decay, warnings, states,
+# blur), no save, no consumable credit and no periodic addon update. Login
+# is never blocked; with an active mode and ShowLoginSummary=1 the player
+# receives a "Persistence unavailable" chat notice, and when AddonEnable=1
+# the addon displays the same status. The state stays unloaded for the whole
 # session, so a reconnect is required once the table is available again.
 #
 # Validation performed while loading:
 #   - unknown Mode -> off (LOG_ERROR)
 #   - 0 <= CriticalThreshold < WarningThreshold <= 100
-#   - HungerStatePenaltyPct and HungerStarvingPenaltyPct clamped to 0..90
+#   - HungerStatePenaltyPct, HungerStarvingPenaltyPct,
+#     ThirstStatePenaltyPct and ThirstDehydratedPenaltyPct clamped to 0..90
 #   - all intervals/cooldowns >= 1000 ms
+#   - ThirstBlurDurationMs clamped to >= 100 ms
 #   - all gauges/percentages/multipliers clamped to their documented range
 ########################################################################################################################
 
@@ -95,53 +110,20 @@ HungerThirst.Enable = 1
 #
 #    HungerThirst.Mode
 #        Simulation mode:
-#          off      - loaded and persisted, but no decay, warnings, damage or
-#                     periodic addon updates (default, safe installation). A
-#                     login snapshot with mode=0 is still sent if
-#                     AddonEnable=1.
+#          off      - loaded and persisted, but no decay, warnings, states,
+#                     blur or periodic addon updates (default, safe
+#                     installation). A login snapshot with mode=0 is still
+#                     sent if AddonEnable=1.
 #          advisory - decay, chat warnings, login summary and addon updates;
-#                     no damage even at 0/0.
-#          survival - everything advisory does, plus exhaustion damage from
-#                     the hydration critical band, stronger when hydration
-#                     reaches 0.
+#                     no states, no blur and no penalty, even at 0/0.
+#          survival - everything advisory does, plus hunger states and thirst
+#                     states (visible auras and their penalties) and the
+#                     thirst blur.
 #        Case-insensitive. An unknown value falls back to "off" and logs an
 #        error.
 #        Default: off
 #
 HungerThirst.Mode = off
-
-#
-#    HungerThirst.Lethal
-#        Only used in survival mode. When 0 (default), damage is non-lethal:
-#        each hit is capped so the player keeps at least 1 health, and a
-#        one-time warning is sent when that floor is reached. When 1, damage
-#        can kill; the death is recorded as a non-PvP death and the death hook
-#        receives a Dehydration/Both cause (Starvation is not produced in
-#        phase 1).
-#        Default: 0
-#
-HungerThirst.Lethal = 0
-
-#
-#    HungerThirst.LethalRampPct
-#        Lethal only, while hydration is at 0: additional percentage of
-#        maximum health added to the DehydratedDamagePct base for each
-#        consecutive hit (the DoubleEmptyMultiplier applies once when both
-#        gauges are at 0, so empty satiety amplifies the thirst hit). Capped
-#        by LethalMaxDamagePct. Clamped to 0..100.
-#        Default: 0.50
-#
-HungerThirst.LethalRampPct = 0.50
-
-#
-#    HungerThirst.LethalMaxDamagePct
-#        Lethal only: cap for a hit while hydration is at 0, as a percentage
-#        of maximum health, ramp included. Critical-band hydration hits
-#        (hydration above 0) use StarvingDamagePct and are not capped by this
-#        value. Clamped to 0..100.
-#        Default: 5.00
-#
-HungerThirst.LethalMaxDamagePct = 5.00
 
 #
 #    HungerThirst.SatietyDecayPerMinute
@@ -180,37 +162,35 @@ HungerThirst.InstanceMultiplier = 1.00
 
 #
 #    HungerThirst.PauseOnTaxi
-#        Suspend decay, warnings and damage while the player is on a taxi
-#        flight.
+#        Suspend decay, warnings and the thirst blur while the player is on a
+#        taxi flight. Thirst state auras already applied stay in place.
 #        Default: 1
 #
 HungerThirst.PauseOnTaxi = 1
 
 #
 #    HungerThirst.PauseInBattleground
-#        Suspend decay, warnings and periodic addon updates while the player
-#        is in a battleground or arena (the arena switch below is an
-#        additional guard). Exhaustion damage is always suppressed in both,
-#        even when this is 0; with both switches at 0, decay and warnings
-#        keep running.
+#        Suspend decay, warnings, periodic addon updates and the thirst blur
+#        while the player is in a battleground or arena (the arena switch
+#        below is an additional guard). With both switches at 0, decay,
+#        warnings and blur keep running.
 #        Default: 1
 #
 HungerThirst.PauseInBattleground = 1
 
 #
 #    HungerThirst.PauseInArena
-#        Suspend decay, warnings and periodic addon updates while the player
-#        is in an arena match. Exhaustion damage is always suppressed in
-#        arenas, even when this is 0 and PauseInBattleground is 0; decay and
-#        warnings then keep running.
+#        Suspend decay, warnings, periodic addon updates and the thirst blur
+#        while the player is in an arena match. With this and
+#        PauseInBattleground at 0, decay, warnings and blur keep running.
 #        Default: 1
 #
 HungerThirst.PauseInArena = 1
 
 #
 #    HungerThirst.ExemptGMs
-#        Suspend the module for accounts with GM security. Also prevents
-#        environmental damage while debugging.
+#        Suspend the module for accounts with GM security, including the
+#        thirst blur. Handy while debugging.
 #        Default: 1
 #
 HungerThirst.ExemptGMs = 1
@@ -219,10 +199,12 @@ HungerThirst.ExemptGMs = 1
 #    HungerThirst.WarningThreshold
 #        Upper bound of the "warning" band, in gauge points. A gauge above
 #        this value is normal; at or below it the player is hungry/thirsty.
-#        In survival mode this is also the satiety threshold at which the
-#        hunger state begins (see HungerThirst.HungerStates); the state is
-#        removed only when satiety returns to the normal band, Hysteresis
-#        included. Must be <= 100 and greater than CriticalThreshold.
+#        In survival mode this is also the threshold at which the hunger
+#        state (satiety) and the thirst state (hydration) begin, see
+#        HungerThirst.HungerStates and HungerThirst.ThirstStates; each state
+#        is removed only when its gauge returns to the normal band,
+#        Hysteresis included. Must be <= 100 and greater than
+#        CriticalThreshold.
 #        Default: 30
 #
 HungerThirst.WarningThreshold = 30
@@ -230,9 +212,11 @@ HungerThirst.WarningThreshold = 30
 #
 #    HungerThirst.CriticalThreshold
 #        Upper bound of the "critical" band, in gauge points. At or below it
-#        the gauge is very low. For hydration this is when survival damage
-#        begins; hydration at 0 is empty and uses the dehydrated path.
-#        Satiety never triggers damage. Must be lower than WarningThreshold.
+#        the gauge is very low. Survival thirst treats the warning and
+#        critical bands the same (state 1, spell 43155); hydration at 0 is
+#        empty and uses state 2 (spell 14869). Satiety never uses this band
+#        beyond the warning state. Also used for band labels and advisory
+#        warnings. Must be lower than WarningThreshold.
 #        Default: 10
 #
 HungerThirst.CriticalThreshold = 10
@@ -281,50 +265,74 @@ HungerThirst.HungerStatePenaltyPct = 10.00
 HungerThirst.HungerStarvingPenaltyPct = 30.00
 
 #
-#    HungerThirst.StarvingDamagePct
-#        Survival only: damage per hit, as a percentage of maximum health,
-#        while hydration is in the critical band
-#        (0 < hydration <= CriticalThreshold) and not at 0.
-#        Clamped to 0..100.
-#        Default: 0.50
+#    HungerThirst.ThirstStates
+#        Survival only. When 1 (default), the hydration gauge applies a
+#        visible thirst state:
+#          - hydration at or below WarningThreshold (warning or critical
+#            band, above 0): spell 43155 "Drink" with the penalties of
+#            ThirstStatePenaltyPct;
+#          - hydration at 0: spell 14869 "Drunken Stupor" with the penalties
+#            of ThirstDehydratedPenaltyPct, replacing spell 43155.
+#        Both states reduce mana regeneration, magical damage done and
+#        healing done by their percentage. Physical, ranged and pet damage
+#        are unaffected, and so is damage taken. The state is removed when
+#        hydration returns to the normal band (Hysteresis included), outside
+#        survival mode, and when this option is 0 - thirst then has no
+#        gameplay effect at all. If either spell cannot be patched at
+#        startup, states are disabled and an error is logged. The two spells
+#        keep their Blizzard names and icons; the chat message sent when the
+#        state begins is the authoritative description.
+#        Default: 1
 #
-HungerThirst.StarvingDamagePct = 0.50
+HungerThirst.ThirstStates = 1
 
 #
-#    HungerThirst.StarvingIntervalMs
-#        Survival only: milliseconds between hits while hydration is critical
-#        and not at 0. Values below 1000 are clamped to 1000.
+#    HungerThirst.ThirstStatePenaltyPct
+#        Survival only, ThirstStates=1: penalty while hydration is in the
+#        warning or critical band (above 0). Mana regeneration (spirit-based
+#        regeneration only, see the header), magical damage done and healing
+#        done are reduced by this percentage. Clamped to 0..90.
+#        Baked into spell 43155 when the worldserver starts: changing this
+#        value requires a restart, ".reload config" is not enough.
+#        Default: 10.00
+#
+HungerThirst.ThirstStatePenaltyPct = 10.00
+
+#
+#    HungerThirst.ThirstDehydratedPenaltyPct
+#        Survival only, ThirstStates=1: penalty while hydration is at 0,
+#        replacing ThirstStatePenaltyPct. Mana regeneration (spirit-based
+#        regeneration only, see the header), magical damage done and healing
+#        done are reduced by this percentage. Clamped to 0..90.
+#        Baked into spell 14869 when the worldserver starts: changing this
+#        value requires a restart, ".reload config" is not enough.
+#        Default: 30.00
+#
+HungerThirst.ThirstDehydratedPenaltyPct = 30.00
+
+#
+#    HungerThirst.ThirstBlurIntervalMs
+#        Survival only, ThirstStates=1: milliseconds between two blur
+#        pulses. The blur is a client-side visual only: it writes the fake
+#        inebriation player field (PLAYER_FAKE_INEBRIATION), with no aura, no
+#        icon and no gameplay effect. No pulse is sent while a pause applies
+#        (dead, state not loaded, duel, or a configured
+#        taxi/battleground/arena/GM pause), in advisory/off mode or with
+#        ThirstStates=0; a pulse in progress is cleared. Values below 1000
+#        are clamped to 1000.
 #        Default: 10000
 #
-HungerThirst.StarvingIntervalMs = 10000
+HungerThirst.ThirstBlurIntervalMs = 10000
 
 #
-#    HungerThirst.DehydratedDamagePct
-#        Survival only: base damage per hit, as a percentage of maximum
-#        health, as soon as hydration is at 0, whatever satiety is. Clamped
-#        to 0..100.
-#        Default: 1.00
+#    HungerThirst.ThirstBlurDurationMs
+#        Survival only, ThirstStates=1: duration of one blur pulse in
+#        milliseconds. The intensity is 35 while hydration is in the warning
+#        or critical band (state 1) and 60 at 0 (state 2). Values below 100
+#        are clamped to 100.
+#        Default: 2000
 #
-HungerThirst.DehydratedDamagePct = 1.00
-
-#
-#    HungerThirst.DehydratedIntervalMs
-#        Survival only: milliseconds between hits while hydration is at 0.
-#        Values below 1000 are clamped to 1000.
-#        Default: 5000
-#
-HungerThirst.DehydratedIntervalMs = 5000
-
-#
-#    HungerThirst.DoubleEmptyMultiplier
-#        Survival only: when both gauges are at 0, the DehydratedDamagePct
-#        base is multiplied by this value once, so the empty satiety gauge
-#        amplifies the thirst hit. No percentages are added together. In
-#        lethal mode the same single multiplier applies to the ramp base.
-#        Clamped to 1.00..10.00.
-#        Default: 1.50
-#
-HungerThirst.DoubleEmptyMultiplier = 1.50
+HungerThirst.ThirstBlurDurationMs = 2000
 
 #
 #    HungerThirst.FoodSatietyGain
@@ -403,7 +411,7 @@ HungerThirst.ShowLoginSummary = 1
 #
 #    HungerThirst.DebugLog
 #        Emit LOG_DEBUG lines for state load/save, consumable credits and
-#        exhaustion damage.
+#        thirst state/blur transitions.
 #        Default: 0
 #
 HungerThirst.DebugLog = 0
@@ -422,7 +430,8 @@ HungerThirst.DebugLog = 0
 #        The payload is the prefix plus exactly 8 fields (no extra field):
 #        satiety/hydration use one decimal; mode is 0=off, 1=advisory,
 #        2=survival; bands are 0=normal, 1=warning, 2=critical, 3=empty;
-#        lethal/loaded/persistence are 0/1. No colors.
+#        lethal is reserved for addon compatibility and always sent as 0;
+#        loaded/persistence are 0/1. No colors.
 #        Default: 1
 #
 HungerThirst.AddonEnable = 1
