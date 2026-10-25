@@ -51,6 +51,8 @@ struct Config
     bool   ThirstStates               = true;
     double ThirstStatePenaltyPct      = 10.00;
     double ThirstDehydratedPenaltyPct = 30.00;
+    uint32 ThirstBlurIntervalMs       = 10000;
+    uint32 ThirstBlurDurationMs       = 2000;
     uint32 WarningThreshold        = 30;
     uint32 CriticalThreshold       = 10;
     double FoodSatietyGain         = 30.00;

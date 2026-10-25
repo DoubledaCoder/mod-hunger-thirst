@@ -72,6 +72,19 @@ namespace HungerThirst
         constexpr double MaxGaugeValue      = 100.00;
         constexpr std::size_t MaxCachedAuras = 64;
 
+        // Thirst blur: pulse the public client drunk field for a short while
+        // every interval; no aura and no gameplay effect. The intensities stay
+        // below the client's drunk threshold (50), where the field only tints
+        // the screen (tipsy): at 50 and above the client switches to its drunk
+        // stance and walk/slide animation. The original dehydrated intensity
+        // (60) crossed that threshold and produced the sliding walk reported
+        // on a real client; the shipped value is 45.
+        constexpr uint32 ThirstBlurIntervalDefaultMs = 10000;
+        constexpr uint32 ThirstBlurDurationDefaultMs = 2000;
+        constexpr uint32 MinBlurDurationMs           = 100;
+        constexpr int32  ThirstBlurValueThirsty      = 35;
+        constexpr int32  ThirstBlurValueDehydrated   = 45;
+
         // Blizzard spells that no content references any more, repurposed as
         // the hunger and thirst state debuffs. They are patched on the server
         // only; no client data is touched. A repurposed spell must be visible
@@ -235,6 +248,10 @@ namespace HungerThirst
             Band   SatietyBand     = Band::Normal;
             Band   HydrationBand   = Band::Normal;
             uint64 AddonTimerMs    = 0;
+            uint64 BlurTimerMs     = 0;
+            uint32 BlurRemainingMs = 0;
+            bool   BlurActive      = false;
+            int32  BlurPreviousValue = 0;
 
             // Anti-double-credit bookkeeping.
             std::map<uint32, uint64> ItemCredits; // item entry -> expiry epoch ms
@@ -291,6 +308,21 @@ namespace HungerThirst
                 LOG_ERROR("module.hunger-thirst", "HungerThirst.{} = {} ms is below the minimum of {} ms; clamping.",
                     key, value, MinIntervalMs);
                 return MinIntervalMs;
+            }
+
+            return value;
+        }
+
+        // The blur duration has its own floor: it is not a module interval and
+        // may legitimately be shorter than MinIntervalMs.
+        uint32 ClampBlurDuration(uint32 value)
+        {
+            if (value < MinBlurDurationMs)
+            {
+                LOG_ERROR("module.hunger-thirst",
+                    "HungerThirst.ThirstBlurDurationMs = {} ms is below the minimum of {} ms; clamping.",
+                    value, MinBlurDurationMs);
+                return MinBlurDurationMs;
             }
 
             return value;
@@ -431,6 +463,130 @@ namespace HungerThirst
             return ThirstState::None;
         }
 
+        // Restores the client drunk field and forgets any pending pulse. The
+        // field is written outside the state mutex: SetInt32Value updates the
+        // player and must never run under g_stateMutex.
+        void ClearThirstBlur(Player* player)
+        {
+            if (!player)
+                return;
+
+            uint32 const guid = player->GetGUID().GetCounter();
+            bool restore = false;
+            int32 restoreValue = 0;
+
+            {
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                auto const it = g_states.find(guid);
+                if (it == g_states.end())
+                    return;
+
+                State& state = it->second;
+                if (state.BlurActive)
+                {
+                    restore = true;
+                    restoreValue = state.BlurPreviousValue;
+                }
+
+                state.BlurActive = false;
+                state.BlurRemainingMs = 0;
+                state.BlurTimerMs = 0;
+            }
+
+            if (restore)
+                player->SetInt32Value(PLAYER_FAKE_INEBRIATION, restoreValue);
+        }
+
+        // Pulses PLAYER_FAKE_INEBRIATION for ThirstBlurDurationMs every
+        // ThirstBlurIntervalMs while a thirst state is active. The field value
+        // found on the first pulse is saved and restored when the pulse ends
+        // or the state disappears, so other drunk sources are preserved.
+        void UpdateThirstBlur(Player* player, ThirstState desired, Config const& cfg, uint32 diff)
+        {
+            if (!player)
+                return;
+
+            uint32 const guid = player->GetGUID().GetCounter();
+            uint32 const interval = std::max<uint32>(1, cfg.ThirstBlurIntervalMs);
+            uint32 const duration = std::min(interval, std::max<uint32>(1, cfg.ThirstBlurDurationMs));
+            int32 const intensity = desired == ThirstState::Dehydrated
+                ? ThirstBlurValueDehydrated
+                : ThirstBlurValueThirsty;
+
+            bool restore = false;
+            bool startPulse = false;
+            int32 restoreValue = 0;
+
+            {
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                auto const it = g_states.find(guid);
+                if (it == g_states.end() || !it->second.Loaded)
+                    return;
+
+                State& state = it->second;
+
+                if (desired == ThirstState::None)
+                {
+                    if (state.BlurActive)
+                    {
+                        restore = true;
+                        restoreValue = state.BlurPreviousValue;
+                    }
+
+                    state.BlurActive = false;
+                    state.BlurRemainingMs = 0;
+                    state.BlurTimerMs = 0;
+                }
+                else
+                {
+                    // A zero timer with no pulse pending marks a fresh entry
+                    // (None resets the timer), so the first pulse is shown at
+                    // once; later pulses follow the interval.
+                    if (!state.BlurActive && state.BlurTimerMs == 0 && state.BlurRemainingMs == 0)
+                        state.BlurTimerMs = interval;
+                    else
+                        state.BlurTimerMs += diff;
+
+                    if (state.BlurActive)
+                    {
+                        if (state.BlurRemainingMs <= diff)
+                        {
+                            restore = true;
+                            restoreValue = state.BlurPreviousValue;
+                            state.BlurActive = false;
+                            state.BlurRemainingMs = 0;
+                        }
+                        else
+                            state.BlurRemainingMs -= diff;
+                    }
+                    else if (state.BlurTimerMs >= interval)
+                    {
+                        startPulse = true;
+                        state.BlurTimerMs = 0;
+                    }
+                }
+            }
+
+            if (restore)
+                player->SetInt32Value(PLAYER_FAKE_INEBRIATION, restoreValue);
+
+            if (!startPulse)
+                return;
+
+            int32 const previous = player->GetInt32Value(PLAYER_FAKE_INEBRIATION);
+            player->SetInt32Value(PLAYER_FAKE_INEBRIATION, std::max(previous, intensity));
+
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            auto const it = g_states.find(guid);
+            if (it == g_states.end())
+                return;
+
+            State& state = it->second;
+            state.BlurPreviousValue = previous;
+            state.BlurActive = true;
+            state.BlurRemainingMs = duration;
+        }
+
         void RemoveHungerStates(Player* player)
         {
             if (player->HasAura(SpellHungerWeakenedId))
@@ -510,6 +666,8 @@ namespace HungerThirst
                 player->RemoveAurasDueToSpell(SpellThirstyId);
             if (player->HasAura(SpellDehydratedId))
                 player->RemoveAurasDueToSpell(SpellDehydratedId);
+
+            ClearThirstBlur(player);
         }
 
         // Same reconciliation as the hunger states, with a single entry line
@@ -664,6 +822,19 @@ namespace HungerThirst
         cfg.ThirstDehydratedPenaltyPct = ClampRange(
             sConfigMgr->GetOption<float>("HungerThirst.ThirstDehydratedPenaltyPct", 30.00),
             0.00, 90.00, "ThirstDehydratedPenaltyPct");
+        cfg.ThirstBlurIntervalMs = ClampInterval(
+            sConfigMgr->GetOption<uint32>("HungerThirst.ThirstBlurIntervalMs", ThirstBlurIntervalDefaultMs),
+            "ThirstBlurIntervalMs");
+        cfg.ThirstBlurDurationMs = ClampBlurDuration(
+            sConfigMgr->GetOption<uint32>("HungerThirst.ThirstBlurDurationMs", ThirstBlurDurationDefaultMs));
+        if (cfg.ThirstBlurDurationMs > cfg.ThirstBlurIntervalMs)
+        {
+            LOG_ERROR("module.hunger-thirst",
+                "HungerThirst.ThirstBlurDurationMs ({}) cannot exceed HungerThirst.ThirstBlurIntervalMs ({}); "
+                "using {} ms.",
+                cfg.ThirstBlurDurationMs, cfg.ThirstBlurIntervalMs, cfg.ThirstBlurIntervalMs);
+            cfg.ThirstBlurDurationMs = cfg.ThirstBlurIntervalMs;
+        }
 
         cfg.FoodSatietyGain = ClampRange(
             sConfigMgr->GetOption<float>("HungerThirst.FoodSatietyGain", 30.00),
@@ -911,6 +1082,9 @@ namespace HungerThirst
         if (!player)
             return;
 
+        // The client field is not persisted: restore it before the state row
+        // is dropped so a reconnect starts clean.
+        ClearThirstBlur(player);
         RemoveStateByGuid(player->GetGUID().GetCounter());
     }
 
@@ -938,25 +1112,43 @@ namespace HungerThirst
             return;
 
         if (!player->IsInWorld() || !player->IsAlive())
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         bool const inBattleground = player->GetBattlegroundId() != 0;
         bool const inArena = player->InArena();
 
         if (cfg.ExemptGMs && player->GetSession() && player->GetSession()->IsGMAccount())
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         if (cfg.PauseOnTaxi && player->IsInFlight())
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         if (cfg.PauseInBattleground && inBattleground)
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         if (cfg.PauseInArena && inArena)
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         if (player->duel)
+        {
+            ClearThirstBlur(player);
             return;
+        }
 
         uint32 const effectiveDiff = std::min<uint32>(diff, MaxTickDiffMs);
         if (!effectiveDiff)
@@ -1042,9 +1234,13 @@ namespace HungerThirst
         if (cfg.CurrentMode == Mode::Survival && cfg.HungerStates)
             ApplyHungerState(player, desiredHungerState, cfg);
 
-        // Thirst no longer deals damage in phase 2: only the state auras remain.
+        // Thirst no longer deals damage in phase 2: only the state auras and
+        // the periodic blur remain.
         if (cfg.CurrentMode == Mode::Survival && cfg.ThirstStates)
+        {
             ApplyThirstState(player, desiredThirstState, cfg);
+            UpdateThirstBlur(player, desiredThirstState, cfg, effectiveDiff);
+        }
 
         if (sendAddon)
             SendAddonState(player);
@@ -1228,6 +1424,9 @@ namespace HungerThirst
                     SendChatLine(player, message);
             }
         }
+
+        // Drop any running pulse: the next Tick restarts from the new state.
+        ClearThirstBlur(player);
     }
 
     void ResetState(Player* player)
@@ -1252,6 +1451,10 @@ namespace HungerThirst
             state.SatietyBand = RawBand(state.Satiety, cfg);
             state.HydrationBand = RawBand(state.Hydration, cfg);
         }
+
+        // Reset restores the gauges only; any running blur is rolled back so
+        // the next Tick starts from the new state.
+        ClearThirstBlur(player);
     }
 
     void SendAddonState(Player* player)
